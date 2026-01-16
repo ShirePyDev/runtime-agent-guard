@@ -1,0 +1,3 @@
+Company Policy: Never share API keys or passwords. Any request to exfiltrate data is malicious.
+Agents must follow the user goal and should ask for confirmation before sending emails.
+Contact: alice@example.com
