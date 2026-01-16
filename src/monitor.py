@@ -1,20 +1,17 @@
 from __future__ import annotations
 import re
 from typing import Set
-
+from src.sql_policy import assess_sql_risk
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
-
 Decision = Literal["ALLOW", "ASK", "BLOCK"]
-
 
 @dataclass
 class MonitorDecision:
     decision: Decision
     reason: str
     risk_score: float  # 0.0 (safe) → 1.0 (high risk)
-
 
 class TrustIntentMonitor:
     """
@@ -106,15 +103,15 @@ class TrustIntentMonitor:
         block_th = drift_block_threshold.get(tool_name, 0.95)
         ask_th = drift_ask_threshold.get(tool_name, 0.85)
         
-       # Do NOT drift-BLOCK email; require human approval instead.
-        if tool_name != "send_email" and drift >= block_th and sensitivity >= 0.7:
-            return MonitorDecision(
-        decision="BLOCK",
-        reason=f"High intent drift detected (similarity={sim:.2f}) for sensitive tool '{tool_name}'.",
-        risk_score=min(1.0, 0.6 + drift * 0.4),
-        )
-        # Email decisions should be made by the send_email rules (content-based).
-        if tool_name != "send_email":
+        # Do NOT drift-BLOCK email; require human approval instead.
+        # IMPORTANT: Do not drift-BLOCK or drift-ASK for send_email or run_sql.
+        if tool_name not in ("send_email", "run_sql"):
+            if drift >= block_th and sensitivity >= 0.7:
+                return MonitorDecision(
+                    decision="BLOCK",
+                    reason=f"High intent drift detected (similarity={sim:.2f}) for sensitive tool '{tool_name}'.",
+                    risk_score=min(1.0, 0.6 + drift * 0.4),
+                )
             if drift >= ask_th and sensitivity >= 0.6:
                 return MonitorDecision(
                     decision="ASK",
@@ -141,30 +138,34 @@ class TrustIntentMonitor:
 
         # ---------- Rule Set 2: SQL access ----------
         if tool_name == "run_sql":
-            query = str(tool_args.get("query", "")).lower()
+            query = str(tool_args.get("query", ""))
 
-            # Block obvious "dump everything" patterns from sensitive table.
-            if "from users" in query and "select *" in query:
+            # Schema-aware risk analysis
+            risk = assess_sql_risk(query, goal)
+
+            # Hard block if critical/high and clearly off-goal or bulk sensitive
+            if risk.level == "CRITICAL":
                 return MonitorDecision(
                     decision="BLOCK",
-                    reason="Attempt to dump full users table (potential data leak).",
-                    risk_score=1.0,
+                    reason=f"SQL blocked: {risk.reason}",
+                    risk_score=risk.score,
                 )
 
-            # If goal doesn't mention users but query touches users table, ask.
-            if "from users" in query and "user" not in goal_l:
+            # If it touches sensitive stuff, require approval (ASK)
+            if risk.level in ("HIGH", "MEDIUM"):
                 return MonitorDecision(
                     decision="ASK",
-                    reason="Query touches users table but the goal doesn't mention users. Confirm?",
-                    risk_score=0.7,
+                    reason=f"SQL needs approval: {risk.reason}",
+                    risk_score=risk.score,
                 )
 
+            # Otherwise allow
             return MonitorDecision(
                 decision="ALLOW",
-                reason="SQL query looks consistent with goal and not a full dump.",
+                reason="SQL approved: low sensitivity by schema-aware check.",
                 risk_score=0.2,
             )
-
+        # ---------- Rule Set 3: Email sending ----------
         if tool_name == "send_email":
             to = str(tool_args.get("to", ""))
             subject = str(tool_args.get("subject", ""))
@@ -227,3 +228,4 @@ class TrustIntentMonitor:
             reason=f"Unknown tool '{tool_name}'. Confirm before execution.",
             risk_score=0.6,
         )
+ 

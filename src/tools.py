@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from dotenv import load_dotenv
 import os
 import re
 import sqlite3
@@ -14,6 +14,7 @@ DOCS_DIR = PROJECT_ROOT / "data" / "docs"
 DB_PATH = PROJECT_ROOT / "data" / "db" / "app.db"
 LOGS_DIR = PROJECT_ROOT / "logs"
 EMAIL_LOG = LOGS_DIR / "email.log"
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 @dataclass
