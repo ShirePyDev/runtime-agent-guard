@@ -40,7 +40,9 @@ class TrustIntentMonitor:
             "read_file": 0.6,
             "run_sql": 0.7,
             "send_email": 0.9,
+            "search_wikipedia": 0.3
         }
+
 
     # ✅ These MUST be class methods (same indentation as __init__)
     def _tokenize(self, text: str) -> Set[str]:
@@ -135,6 +137,23 @@ class TrustIntentMonitor:
                 reason="Reading from allowed docs directory.",
                 risk_score=0.1,
             )
+        if tool_name == "search_wikipedia":
+            query = tool_args.get("query", "")
+
+            # Wikipedia is read-only but untrusted
+            if not query or len(query.strip()) < 3:
+                return MonitorDecision(
+                    decision="ASK",
+                    reason="Wikipedia query is too vague. Confirm intent.",
+                    risk_score=0.4,
+                )
+
+            return MonitorDecision(
+                decision="ALLOW",
+                reason="Wikipedia search allowed (read-only, bounded).",
+                risk_score=0.3,
+    )
+
 
         # ---------- Rule Set 2: SQL access ----------
         if tool_name == "run_sql":
@@ -166,6 +185,18 @@ class TrustIntentMonitor:
                 risk_score=0.2,
             )
         # ---------- Rule Set 3: Email sending ----------
+        if tool_name == "send_email":
+            body = str(tool_args.get("body", ""))
+            tainted = bool(tool_args.get("tainted", False))
+            sources = tool_args.get("taint_sources", [])
+
+            if tainted:
+                return MonitorDecision(
+                    decision="ASK",
+                    reason=f"Email includes untrusted external content (tainted source: {sources}). Confirm before sending.",
+                    risk_score=0.7,
+                )
+
         if tool_name == "send_email":
             to = str(tool_args.get("to", ""))
             subject = str(tool_args.get("subject", ""))

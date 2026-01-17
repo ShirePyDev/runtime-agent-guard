@@ -3,10 +3,10 @@ from dotenv import load_dotenv
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -16,12 +16,13 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 EMAIL_LOG = LOGS_DIR / "email.log"
 load_dotenv(PROJECT_ROOT / ".env")
 
-
 @dataclass
 class ToolResult:
     ok: bool
-    result: Any
-    error: str | None = None
+    result: Any = None
+    error: Optional[str] = None
+    meta: Dict[str, Any] = field(default_factory=dict)  # <-- NEW
+
 
 
 def _ensure_logs_dir() -> None:
@@ -180,13 +181,69 @@ def send_email(to: str, subject: str, body: str) -> ToolResult:
     except Exception as e:
         return ToolResult(ok=False, result=None, error=str(e))
 
+def search_wikipedia(query: str, max_chars: int = 500) -> ToolResult:
+    """
+    Read-only Wikipedia lookup.
+    - Returns the first paragraph only
+    - Hard character limit
+    - Marks output as tainted (untrusted external text)
+    """
+    if not query or not query.strip():
+        return ToolResult(ok=False, result=None, error="query is empty")
+
+    try:
+        import wikipedia
+        wikipedia.set_lang("en")
+
+        page = wikipedia.page(query, auto_suggest=False)
+
+        # First paragraph only
+        summary = page.content.split("\n\n")[0].strip()
+
+        # Hard limit
+        if len(summary) > max_chars:
+            summary = summary[:max_chars] + "..."
+
+        return ToolResult(
+            ok=True,
+            result={"title": page.title, "text": summary},
+            meta={"tainted": True, "source": "wikipedia"},
+        )
+
+    except wikipedia.DisambiguationError as e:
+        return ToolResult(
+            ok=False,
+            result=None,
+            error=f"Ambiguous query. Options: {e.options[:5]}",
+            meta={"tainted": True, "source": "wikipedia"},
+        )
+
+    except wikipedia.PageError:
+        return ToolResult(
+            ok=False,
+            result=None,
+            error="Page not found",
+            meta={"tainted": True, "source": "wikipedia"},
+        )
+
+    except Exception as e:
+        return ToolResult(
+            ok=False,
+            result=None,
+            error=str(e),
+            meta={"tainted": True, "source": "wikipedia"},
+        )
+
+
 
 # -------------------
 # Simple tool registry
 # -------------------
 TOOLS = {
-    "search_docs": search_docs,
-    "read_file": read_file,
     "run_sql": run_sql,
     "send_email": send_email,
+    "read_file": read_file,
+    "search_docs": search_docs,
+    "search_wikipedia": search_wikipedia,
 }
+

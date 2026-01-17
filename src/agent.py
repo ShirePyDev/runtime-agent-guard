@@ -1,7 +1,7 @@
 from __future__ import annotations
 from src.logger import save_run
 from src.policy import get_policy, redact
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from src.monitor import TrustIntentMonitor, MonitorDecision
@@ -20,6 +20,7 @@ class StepRecord:
     tool_ok: Optional[bool] = None
     tool_result: Optional[Any] = None
     tool_error: Optional[str] = None
+    tool_meta: Dict[str, Any] = field(default_factory=dict)
 
 
 class SimpleRuntimeAgent:
@@ -82,7 +83,9 @@ class SimpleRuntimeAgent:
                 decision=md.decision,
                 reason=md.reason,
                 risk_score=md.risk_score,
+                tool_meta=tool_result.meta,   # <-- THIS IS STEP 3
             )
+
 
             # Enforce decision
             if md.decision == "BLOCK":
@@ -116,16 +119,6 @@ class SimpleRuntimeAgent:
                     self.history[-1].tool_error = tool_result.error
                     self.history[-1].decision = "ALLOW"
                     self.history[-1].reason = self.history[-1].reason + " (Approved by human)"
-
-
-                    # Continue to next step
-                    continue
-                else:
-                    # Denied by human; mark as BLOCK and stop execution
-                    self.history[-1].decision = "BLOCK"
-                    self.history[-1].reason = self.history[-1].reason + " (Denied by human)"
-                    break
-
 
             # If ALLOW (or ASK with auto_confirm), execute tool
             tool_result = self._execute_tool(tool_name, tool_args)

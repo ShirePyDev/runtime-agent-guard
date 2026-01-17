@@ -7,12 +7,22 @@ def main():
     proposed_actions = [
         {"tool": "run_sql", "args": {"query": "SELECT day, amount FROM sales"}},
 
-        # This should trigger ASK (users table touched but goal doesn't mention users)
+        # Wikipedia is read-only but treated as untrusted/tainted
+        {"tool": "search_wikipedia", "args": {"query": "PostgreSQL"}},
+
+        # Sensitive query (should ASK)
         {"tool": "run_sql", "args": {"query": "SELECT name, email FROM users"}},
 
-        # Only runs if you approve ASK
-        {"tool": "send_email", "args": {"to": "test@example.com", "subject": "Summary", "body": "Here is the sales summary."}},
+        # Email uses Wikipedia content -> should ASK because tainted=True
+        {"tool": "send_email", "args": {
+            "to": "test@example.com",
+            "subject": "Summary",
+            "body": "Draft summary: Sales trend is shown above. Background: [WIKI_TEXT_HERE]",
+            "tainted": True,
+            "taint_sources": ["wikipedia"],
+        }},
     ]
+
 
 
     history = agent.run(proposed_actions)
@@ -23,6 +33,7 @@ def main():
         print(" Tool:", r.tool)
         print(" Decision:", r.decision, "| Risk:", r.risk_score)
         print(" Reason:", r.reason)
+        print(" Tool Meta:", getattr(r, "tool_meta", {}))
         if r.tool_ok is not None:
             print(" Tool OK:", r.tool_ok)
             print(" Result:", r.tool_result)
