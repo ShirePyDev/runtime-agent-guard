@@ -48,6 +48,14 @@ The system operates as a guarded agent loop:
 
 ---
 
+# Runtime Agent Guard
+
+![CI](https://github.com/ShirePyDev/runtime-agent-guard/actions/workflows/ci.yml/badge.svg)
+
+A modular agentic AI runtime guard with policy-based enforcement,
+intent monitoring, and security-aware tool execution.
+
+
 ## Setup (Docker + PostgreSQL)
 
 ### Prerequisites
