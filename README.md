@@ -48,13 +48,6 @@ The system operates as a guarded agent loop:
 
 ---
 
-# Runtime Agent Guard
-
-![CI](https://github.com/ShirePyDev/runtime-agent-guard/actions/workflows/ci.yml/badge.svg)
-![Python](https://img.shields.io/badge/python-3.11-blue)
-![License](https://img.shields.io/badge/license-MIT-green)
-
-
 ## Setup (Docker + PostgreSQL)
 
 ### Prerequisites
