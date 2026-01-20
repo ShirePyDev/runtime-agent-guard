@@ -31,10 +31,12 @@
 
 ### Clone the repository
 ```bash
-  docker compose up -d
-```
 - git clone https://github.com/ShirePyDev/runtime-agent-guard.git
 - cd runtime-agent-guard
+
+- docker compose up -d
+
+```
 
 ## System Architecture
 
