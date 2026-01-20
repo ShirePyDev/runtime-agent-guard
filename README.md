@@ -8,16 +8,6 @@ The system focuses on **runtime control, auditability, and least-privilege enfor
 
 ---
 
-## Quick demo (1 command)
-
-Run the runtime guard through three scenarios that show the three possible decisions:
-
-```bash
-./scripts/demo.sh
-
-
----
-
 ## 🚀 How to Run (Quick Start)
 
 This project demonstrates a **runtime guard** for agentic AI systems that
