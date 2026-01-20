@@ -188,4 +188,4 @@ docker compose up -d
 
 - Does not aim to block all prompt-level attacks
 - Policies are rule-based rather than learned
--Human approval is simulated rather than fully interactive
+- Human approval is simulated rather than fully interactive
