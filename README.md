@@ -109,7 +109,7 @@
 ## Security Design Principles
 
 - **Runtime enforcement**
-  - All tool calls are intercepted before execution
+- All tool calls are intercepted before execution
 
 - **Least privilege**
   - External systems (e.g., databases) are accessed using restricted, read-only roles
