@@ -43,6 +43,8 @@ The system operates as a guarded agent execution loop:
 -BLOCK — execution is prevented
 -Tool outputs are optionally redacted and written to an audit log
 This design ensures that unsafe or ambiguous actions are intercepted before any real-world side effects occur.
+ 
+ ---
 
 ## Core Components
 
@@ -72,6 +74,8 @@ Defense in depth
 -Human-in-the-loop
 -High-impact or ambiguous actions require explicit approval.
 
+---
+
 ## Tooling Overview
 
 PostgreSQL
@@ -85,6 +89,7 @@ Mocked email sender
 Restricted file access
 -File reads are limited to the data/docs directory
 
+---
 
 ## Audit Logging
 
@@ -95,6 +100,7 @@ All decisions and relevant execution metadata are written to runtime logs, inclu
 -Timestamp and execution metadata
 This supports post-hoc analysis and accountability.
 
+---
 
 ## Setup (Docker + PostgreSQL)
 Prerequisites
@@ -103,6 +109,8 @@ Prerequisites
 
 **Start PostgreSQL**
 *docker compose up -d*
+
+---
 
 ### 1️⃣ Clone the repository
 ```bash
