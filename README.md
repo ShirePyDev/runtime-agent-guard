@@ -170,6 +170,22 @@
 - Docker
 - Python 3.x
 
+
 ### Start PostgreSQL
 ```bash
 docker compose up -d
+```
+
+## Intended Use
+
+- Research on agentic AI security
+- Demonstrating runtime guardrails for tool-enabled LLM systems
+- Studying policy-driven and trust-aware agent execution
+- Teaching safe and auditable AI system design
+- Serving as a foundation for advanced runtime policy engines
+
+### Limitations
+
+- Does not aim to block all prompt-level attacks
+- Policies are rule-based rather than learned
+-Human approval is simulated rather than fully interactive
