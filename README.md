@@ -27,12 +27,8 @@
 - Centralized audit logging
 - Modular and extensible architecture
 
----
+## Clone the repository
 
-## 🚀 Quick Start
-
-### Clone the repository
-```bash
 git clone https://github.com/ShirePyDev/runtime-agent-guard.git
 cd runtime-agent-guard
 
