@@ -8,6 +8,28 @@ The system focuses on **runtime control, auditability, and least-privilege enfor
 
 ---
 
+## Quick demo (1 command)
+
+Run the runtime guard through three scenarios that show the three possible decisions:
+
+```bash
+./scripts/demo.sh
+
+
+---
+
+## 🚀 How to Run (Quick Start)
+
+This project demonstrates a **runtime guard** for agentic AI systems that
+intercepts tool calls and decides whether to **ALLOW**, **ASK**, or **BLOCK**
+an action based on security policies.
+
+### 1️⃣ Clone the repository
+```bash
+git clone https://github.com/ShirePyDev/runtime-agent-guard.git
+cd runtime-agent-guard
+
+
 ## Architecture
 The system operates as a guarded agent loop:
 
