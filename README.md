@@ -1,10 +1,40 @@
+# runtime-agent-guard
+
+## Overview
+
+- **runtime-agent-guard** is a runtime security enforcement system for **tool-using AI agents**
+- It intercepts proposed tool actions and enforces explicit policy decisions:
+  - **ALLOW**
+  - **ASK**
+  - **BLOCK**
+- Decisions are enforced **before any tool execution**
+- The system focuses on:
+  - Runtime control of agent behavior
+  - Auditable and inspectable decisions
+  - Least-privilege access to external systems
+  - Human-in-the-loop safety for high-risk actions
+- Designed for **research, experimentation, and demonstration** of trust-aware agent execution
 
 ---
 
-### 👉 **COPY EVERYTHING BELOW AND PASTE IT AFTER THAT PART**
+## Key Features
 
-```md
+- Runtime interception of all agent tool calls
+- Explicit policy decisions (**ALLOW / ASK / BLOCK**)
+- Schema-aware SQL risk analysis
+- Sensitive content detection for email actions
+- Restricted filesystem access
+- Centralized audit logging
+- Modular and extensible architecture
+
 ---
+
+## 🚀 Quick Start
+
+### Clone the repository
+```bash
+git clone https://github.com/ShirePyDev/runtime-agent-guard.git
+cd runtime-agent-guard
 
 ## System Architecture
 
