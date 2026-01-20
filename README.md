@@ -29,8 +29,8 @@
 
 ## Clone the repository
 
-git clone https://github.com/ShirePyDev/runtime-agent-guard.git
-cd runtime-agent-guard
+- git clone https://github.com/ShirePyDev/runtime-agent-guard.git
+- cd runtime-agent-guard
 
 ## System Architecture
 
