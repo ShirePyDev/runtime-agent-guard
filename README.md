@@ -2,18 +2,22 @@
 
 ## Overview
 
-- **runtime-agent-guard** is a runtime security enforcement system for **tool-using AI agents**
-- It intercepts proposed tool actions and enforces explicit policy decisions:
-  - **ALLOW**
-  - **ASK**
-  - **BLOCK**
-- Decisions are enforced **before any tool execution**
-- The system focuses on:
-  - Runtime control of agent behavior
-  - Auditable and inspectable decisions
-  - Least-privilege access to external systems
-  - Human-in-the-loop safety for high-risk actions
-- Designed for **research, experimentation, and demonstration** of trust-aware agent execution
+**runtime-agent-guard** is a runtime security enforcement system for **tool-using AI agents**.
+It intercepts proposed tool actions and enforces explicit policy decisions **before any tool execution occurs**.
+
+The system produces one of three decisions for every agent action:
+
+- **ALLOW** — action is safe and executed immediately
+- **ASK** — action requires explicit human approval
+- **BLOCK** — action is unsafe and execution is prevented
+
+The project focuses on:
+- Runtime control of agent behavior
+- Auditable and inspectable decisions
+- Least-privilege access to external systems
+- Human-in-the-loop safety for high-risk actions
+
+Designed for **research, experimentation, and demonstration** of trust-aware agent execution.
 
 ---
 
@@ -27,102 +31,78 @@
 - Centralized audit logging
 - Modular and extensible architecture
 
-## 🚀 Quick Start
-
-### Clone the repository
-```bash
-- git clone https://github.com/ShirePyDev/runtime-agent-guard.git
-- cd runtime-agent-guard
-
-- docker compose up -d
-
-```
+---
 
 ## System Architecture
 
-- The system is implemented as a **guarded agent execution loop**
-- All agent actions are intercepted by a runtime guard before execution
-- The guard operates independently from the underlying language model
+The system is implemented as a **guarded agent execution loop**.
+All agent actions are intercepted by a runtime guard that operates independently from the underlying language model.
 
 ### Execution Flow
 
-- **Agent Proposal**
-  - The agent proposes an action consisting of:
-    - Tool name
-    - Tool arguments
+1. **Agent Proposal**
+   - The agent proposes an action consisting of:
+     - Tool name
+     - Tool arguments
 
-- **Runtime Monitoring**
-  - A runtime monitor evaluates:
-    - Intent alignment
-    - Tool-specific risk
-    - Policy constraints
+2. **Runtime Monitoring**
+   - A runtime monitor evaluates:
+     - Intent alignment
+     - Tool-specific risk
+     - Policy constraints
 
-- **Policy Decision**
-  - One of three decisions is produced:
-    - **ALLOW** — action is safe and executed immediately
-    - **ASK** — action requires explicit human approval
-    - **BLOCK** — action is unsafe and execution is prevented
+3. **Policy Decision**
+   - One of three decisions is produced:
+     - **ALLOW**
+     - **ASK**
+     - **BLOCK**
 
-- **Execution and Logging**
-  - Allowed actions execute under restricted permissions
-  - Tool outputs are optionally redacted
-  - All decisions and metadata are written to audit logs
+4. **Execution and Logging**
+   - Allowed actions execute under restricted permissions
+   - Tool outputs may be redacted
+   - All decisions and metadata are written to audit logs
 
-- This design ensures unsafe or ambiguous actions are stopped **before real-world side effects occur**
+This design ensures unsafe or ambiguous actions are stopped **before real-world side effects occur**.
 
 ---
 
 ## Core Components
 
-- `src/agent.py`
-  - Minimal agent loop
-  - Enforces runtime guard decisions
+- `src/agent.py`  
+  Minimal agent loop that enforces runtime guard decisions
 
-- `src/monitor.py`
-  - Runtime trust, intent, and risk monitoring
-  - Triggers policy rules
+- `src/monitor.py`  
+  Runtime trust, intent, and risk monitoring
 
-- `src/sql_policy.py`
-  - Schema-aware SQL risk analysis using `sqlglot`
-  - Detects:
-    - Sensitive tables
-    - Sensitive columns
-    - Bulk or unbounded queries
+- `src/sql_policy.py`  
+  Schema-aware SQL risk analysis using `sqlglot`
 
-- `src/policy.py`
-  - Central policy definitions
-  - Decision thresholds
-  - Output redaction rules
+- `src/policy.py`  
+  Central policy definitions and decision thresholds
 
-- `src/tools.py`
-  - Tool implementations
-  - Centralized tool registry
+- `src/tools.py`  
+  Tool implementations and registry
 
-- `src/logger.py`
-  - Runtime audit logging
-  - Records decisions, actions, and metadata
+- `src/logger.py`  
+  Runtime audit logging for decisions and metadata
 
-- The codebase is intentionally modular to support experimentation and extension
+The codebase is intentionally modular to support experimentation and extension.
 
 ---
 
 ## Security Design Principles
 
-- **Runtime enforcement**
-- All tool calls are intercepted before execution
+- **Runtime enforcement**  
+  All tool calls are intercepted before execution
 
-- **Least privilege**
-  - External systems (e.g., databases) are accessed using restricted, read-only roles
+- **Least privilege**  
+  External systems are accessed using restricted, read-only roles
 
-- **Defense in depth**
-  - Independent protections across:
-    - Monitoring
-    - Tool logic
-    - Database access
-    - Output handling
+- **Defense in depth**  
+  Independent protections across monitoring, policy, and tool layers
 
-- **Human-in-the-loop**
-  - High-impact or ambiguous actions require explicit approval
+- **Human-in-the-loop**  
+  High-impact or ambiguous actions require explicit approval
 
 ---
 
@@ -130,62 +110,51 @@
 
 - **PostgreSQL**
   - Accessed via a read-only role (`agent_ro`)
-  - Role provisioned by `data/db/init.sql`
+  - Role provisioned by `data/db/init_sqlite.sql`
 
 - **Schema-aware SQL security**
-  - Implemented using `sqlglot`
-  - Includes:
-    - Sensitive table detection (e.g., `users`, `api_keys`)
-    - Column-level sensitivity (e.g., `users.email`, `api_keys.api_key`)
-    - Detection of bulk or unbounded queries
+  - Sensitive table and column detection
+  - Bulk or unbounded query detection
 
 - **Mocked email sender**
-  - Emails are logged locally for inspection
-  - No external email delivery occurs
+  - Emails are logged locally
+  - No external delivery occurs
 
 - **Restricted file access**
-  - File reads are limited to the `data/docs` directory
+  - File reads limited to `data/docs`
 
 ---
 
 ## Audit Logging
 
-- All runtime decisions are logged, including:
-  - Proposed action and arguments
-  - Policy decision (**ALLOW / ASK / BLOCK**)
-  - Triggered rule and risk reason
-  - Timestamp and execution metadata
+All runtime decisions are logged, including:
+- Proposed action and arguments
+- Policy decision (**ALLOW / ASK / BLOCK**)
+- Triggered rule and risk reason
+- Timestamp and execution metadata
 
-- Audit logs support:
-  - Post-hoc analysis
-  - Debugging and inspection
-  - Accountability and traceability
+Logs support debugging, inspection, and accountability.
 
 ---
-
-## Setup (Docker + PostgreSQL)
-
-### Prerequisites
-
-- Docker
-- Python 3.x
-
-
-### Start PostgreSQL
-```bash
-docker compose up -d
-```
-
-## Intended Use
-
-- Research on agentic AI security
-- Demonstrating runtime guardrails for tool-enabled LLM systems
-- Studying policy-driven and trust-aware agent execution
-- Teaching safe and auditable AI system design
-- Serving as a foundation for advanced runtime policy engines
 
 ### Limitations
 
 - Does not aim to block all prompt-level attacks
+
 - Policies are rule-based rather than learned
+
 - Human approval is simulated rather than fully interactive
+
+---
+
+## Quick Start (Docker + PostgreSQL)
+
+### Prerequisites
+- Docker
+- Python 3.x
+
+### Start services
+```bash
+git clone https://github.com/ShirePyDev/runtime-agent-guard.git
+cd runtime-agent-guard
+docker compose up -d
