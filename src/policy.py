@@ -1,139 +1,127 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Tuple
-
-PolicyMode = Literal["strict", "balanced", "permissive"]
 
 
-@dataclass
-class PolicyConfig:
-    mode: PolicyMode = "balanced"
-
-    # Redaction controls
-    redact_emails: bool = True
-    redact_api_keys: bool = True
-
-    # SQL output limits
-    max_rows: int = 50
-
-
-def get_policy(mode: PolicyMode = "balanced") -> PolicyConfig:
+# -----------------------------
+# Policy definition
+# -----------------------------
+@dataclass(frozen=True)
+class RedactionPolicy:
     """
-    Simple policy profiles.
-    Keep this as your "policy-as-code" entry point.
+    RedactionPolicy controls how tool outputs are sanitized before being stored in logs/history.
+    This is NOT a detector/monitor; it is a post-processing safety layer.
     """
-    if mode == "strict":
-        return PolicyConfig(mode=mode, redact_emails=True, redact_api_keys=True, max_rows=25)
-    if mode == "permissive":
-        return PolicyConfig(mode=mode, redact_emails=False, redact_api_keys=True, max_rows=100)
-    return PolicyConfig(mode="balanced", redact_emails=True, redact_api_keys=True, max_rows=50)
+    mode: str  # "permissive" | "balanced" | "strict"
+
+    # Keyword-based redaction (simple + explainable baseline)
+    secret_keys: Tuple[str, ...] = (
+        "api_key",
+        "apikey",
+        "token",
+        "access_token",
+        "refresh_token",
+        "secret",
+        "password",
+        "passwd",
+        "pwd",
+        "private_key",
+        "ssh_key",
+    )
+
+    # Regex patterns for common secret-like values
+    # Keep these conservative to reduce false positives.
+    patterns: Tuple[Tuple[str, str], ...] = (
+        ("aws_access_key_id", r"\bAKIA[0-9A-Z]{16}\b"),
+        ("aws_secret_access_key", r"\b[0-9A-Za-z/+=]{40}\b"),
+        ("github_pat", r"\bghp_[A-Za-z0-9]{20,}\b"),
+        ("generic_token", r"\b(?:token|api[_-]?key|secret)\s*[:=]\s*[\w\-\/\+=]{8,}\b"),
+    )
+
+    # In strict modes, redact email-like strings too
+    redact_emails: bool = False
 
 
-# --------------------------
-# Redaction patterns (v2)
-# --------------------------
-_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-
-# Key/value style (api_key=..., token: ..., secret=...)
-_KV_SECRET_RE = re.compile(
-    r"\b(api[_-]?key|secret|token|access[_-]?token|refresh[_-]?token)\b\s*[:=]\s*([A-Za-z0-9_\-]{6,})",
-    re.IGNORECASE,
-)
-
-# JSON style: "api_key": "...."
-_JSON_SECRET_RE = re.compile(
-    r'("?(api[_-]?key|secret|token|access[_-]?token|refresh[_-]?token)"?\s*:\s*")([^"]{6,})(")',
-    re.IGNORECASE,
-)
-
-# OpenAI-like keys often start with sk-
-_SK_LIKE_RE = re.compile(r"\bsk-[A-Za-z0-9]{10,}\b")
-
-# JWT token pattern: xxx.yyy.zzz (base64url-ish)
-_JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")
-
-# Private key blocks
-_PRIVATE_KEY_BLOCK_RE = re.compile(
-    r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |)PRIVATE KEY-----",
-    re.DOTALL,
-)
-
-
-def redact(value: Any, policy: PolicyConfig) -> Any:
+def get_policy(mode: str = "balanced") -> RedactionPolicy:
     """
-    Redact sensitive info from tool outputs BEFORE storing/logging.
-    Works for strings, dicts, lists, tuples (common tool outputs).
-    Returns the same structure type.
+    Return a concrete policy configuration by mode.
+    The agent calls this once at initialization.
     """
-    redacted_value, _summary = redact_with_summary(value, policy)
-    return redacted_value
+    m = (mode or "balanced").strip().lower()
+
+    if m == "permissive":
+        return RedactionPolicy(mode="permissive", redact_emails=False)
+    if m == "strict":
+        return RedactionPolicy(mode="strict", redact_emails=True)
+
+    # default: balanced
+    return RedactionPolicy(mode="balanced", redact_emails=False)
 
 
-def redact_with_summary(value: Any, policy: PolicyConfig) -> Tuple[Any, Dict[str, int]]:
+# -----------------------------
+# Redaction engine
+# -----------------------------
+_RE_EMAIL = re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")
+
+
+def _redact_text(text: str, policy: RedactionPolicy) -> str:
+    s = text
+
+    # 1) Pattern-based redaction
+    for (_name, pat) in policy.patterns:
+        s = re.sub(pat, "[REDACTED]", s)
+
+    # 2) Key-value style redaction (simple heuristic)
+    # e.g., "api_key=XXXXX", "token: XXXXX"
+    for k in policy.secret_keys:
+        # redact values after key separators
+        s = re.sub(
+            rf"(\b{k}\b\s*[:=]\s*)([^\s,;]+)",
+            r"\1[REDACTED]",
+            s,
+            flags=re.IGNORECASE,
+        )
+
+    # 3) Optional email redaction (strict)
+    if policy.redact_emails:
+        s = _RE_EMAIL.sub("[REDACTED_EMAIL]", s)
+
+    return s
+
+
+def redact(obj: Any, policy: RedactionPolicy) -> Any:
     """
-    Same as redact(), but returns a summary count you can attach to audit logs:
-    {"emails": n, "secrets": m}
+    Recursively redact sensitive content from tool results for safe logging.
+
+    Supported inputs:
+    - str
+    - dict / list / tuple
+    - other primitives (returned as-is)
     """
-    summary = {"emails": 0, "secrets": 0}
+    if obj is None:
+        return None
 
-    def _redact_inner(v: Any) -> Any:
-        if v is None:
-            return None
+    # Strings
+    if isinstance(obj, str):
+        return _redact_text(obj, policy)
 
-        if isinstance(v, str):
-            text = v
+    # Mappings (dict-like)
+    if isinstance(obj, Mapping):
+        redacted: Dict[Any, Any] = {}
+        for k, v in obj.items():
+            # If the key itself indicates secrets, redact the entire value
+            if isinstance(k, str) and k.strip().lower() in policy.secret_keys:
+                redacted[k] = "[REDACTED]"
+            else:
+                redacted[k] = redact(v, policy)
+        return redacted
 
-            if policy.redact_emails:
-                matches = list(_EMAIL_RE.finditer(text))
-                if matches:
-                    summary["emails"] += len(matches)
-                    text = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+    # Sequences (list/tuple), but NOT bytes
+    if isinstance(obj, (list, tuple)):
+        items = [redact(x, policy) for x in obj]
+        return tuple(items) if isinstance(obj, tuple) else items
 
-            if policy.redact_api_keys:
-                # Private key block
-                m = _PRIVATE_KEY_BLOCK_RE.search(text)
-                if m:
-                    summary["secrets"] += 1
-                    text = _PRIVATE_KEY_BLOCK_RE.sub("[REDACTED_PRIVATE_KEY_BLOCK]", text)
-
-                # sk- keys
-                matches = list(_SK_LIKE_RE.finditer(text))
-                if matches:
-                    summary["secrets"] += len(matches)
-                    text = _SK_LIKE_RE.sub("[REDACTED_SECRET]", text)
-
-                # JWTs
-                matches = list(_JWT_RE.finditer(text))
-                if matches:
-                    summary["secrets"] += len(matches)
-                    text = _JWT_RE.sub("[REDACTED_JWT]", text)
-
-                # key/value style
-                matches = list(_KV_SECRET_RE.finditer(text))
-                if matches:
-                    summary["secrets"] += len(matches)
-                    text = _KV_SECRET_RE.sub(r"\1: [REDACTED_SECRET]", text)
-
-                # JSON style
-                matches = list(_JSON_SECRET_RE.finditer(text))
-                if matches:
-                    summary["secrets"] += len(matches)
-                    text = _JSON_SECRET_RE.sub(r'\1[REDACTED_SECRET]\4', text)
-
-            return text
-
-        if isinstance(v, dict):
-            return {k: _redact_inner(val) for k, val in v.items()}
-
-        if isinstance(v, list):
-            return [_redact_inner(x) for x in v]
-
-        if isinstance(v, tuple):
-            return tuple(_redact_inner(x) for x in v)
-
-        return v
-
-    out = _redact_inner(value)
-    return out, summary
+    # For other data types (int/float/bool/etc.), return unchanged
+    return obj

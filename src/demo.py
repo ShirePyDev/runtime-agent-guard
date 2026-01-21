@@ -5,15 +5,15 @@ def main():
     agent = SimpleRuntimeAgent(goal)
 
     proposed_actions = [
-        {"tool": "run_sql", "args": {"query": "SELECT day, amount FROM sales"}},
+        # ✅ Step 1: low-risk (has LIMIT) -> should ALLOW
+        {"tool": "run_sql", "args": {"query": "SELECT day, amount FROM sales LIMIT 50"}},
 
-        # Wikipedia is read-only but treated as untrusted/tainted
         {"tool": "search_wikipedia", "args": {"query": "PostgreSQL"}},
 
-        # Sensitive query (should ASK)
-        {"tool": "run_sql", "args": {"query": "SELECT name, email FROM users"}},
+        # ✅ Step 3: sensitive table -> should ASK (even with LIMIT)
+        {"tool": "run_sql", "args": {"query": "SELECT name, email FROM users LIMIT 50"}},
 
-        # Email uses Wikipedia content -> should ASK because tainted=True
+        # Step 4: tainted -> should ASK
         {"tool": "send_email", "args": {
             "to": "test@example.com",
             "subject": "Summary",
@@ -22,8 +22,6 @@ def main():
             "taint_sources": ["wikipedia"],
         }},
     ]
-
-
 
     history = agent.run(proposed_actions)
 
@@ -42,3 +40,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
