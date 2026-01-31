@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,8 +16,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DOCS_DIR = (PROJECT_ROOT / "data" / "docs").resolve()
 LOGS_DIR = (PROJECT_ROOT / "logs").resolve()
 EMAIL_LOG = LOGS_DIR / "email.log"
+DB_PATH = (PROJECT_ROOT / "data" / "db" / "app.db").resolve()
 
-# Load .env once (consistent across tools)
+# Load .env once (consistent across tools). Safe even if file doesn't exist.
 load_dotenv(PROJECT_ROOT / ".env")
 
 
@@ -39,6 +41,15 @@ def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _prov(source: str, tainted: bool, **extra: Any) -> Dict[str, Any]:
+    """
+    Standard provenance metadata so monitor + logger can reason about taint.
+    """
+    p = {"source": source, "tainted": bool(tainted)}
+    p.update(extra)
+    return {"provenance": p}
+
+
 # ---------------------------------------------------------------------
 # Tool 1: search_docs(query)
 # ---------------------------------------------------------------------
@@ -48,10 +59,10 @@ def search_docs(query: str, max_matches: int = 5) -> ToolResult:
     Returns small snippets (file + line number + line content).
     """
     if not query or not query.strip():
-        return ToolResult(ok=False, error="query is empty")
+        return ToolResult(ok=False, error="query is empty", meta=_prov("docs", tainted=False))
 
     if not DOCS_DIR.exists():
-        return ToolResult(ok=False, error=f"docs directory not found: {DOCS_DIR}")
+        return ToolResult(ok=False, error=f"docs directory not found: {DOCS_DIR}", meta=_prov("docs", tainted=False))
 
     q = query.strip().lower()
     matches: List[Dict[str, str]] = []
@@ -73,10 +84,10 @@ def search_docs(query: str, max_matches: int = 5) -> ToolResult:
                         "line": f"{i}: {line.strip()}",
                     }
                 )
-                if len(matches) >= max_matches:
-                    return ToolResult(ok=True, result=matches)
+                if len(matches) >= int(max_matches):
+                    return ToolResult(ok=True, result=matches, meta=_prov("docs", tainted=False, match_count=len(matches)))
 
-    return ToolResult(ok=True, result=matches)
+    return ToolResult(ok=True, result=matches, meta=_prov("docs", tainted=False, match_count=len(matches)))
 
 
 # ---------------------------------------------------------------------
@@ -85,10 +96,10 @@ def search_docs(query: str, max_matches: int = 5) -> ToolResult:
 def read_file(path: str, max_chars: int = 2000) -> ToolResult:
     """
     Reads a file ONLY if it is inside data/docs.
-    Prevents path traversal like ../../secrets.txt
+    Prevents traversal like ../../secrets.txt
     """
     if not path or not path.strip():
-        return ToolResult(ok=False, error="path is empty")
+        return ToolResult(ok=False, error="path is empty", meta=_prov("file", tainted=False))
 
     raw = path.strip()
 
@@ -106,34 +117,36 @@ def read_file(path: str, max_chars: int = 2000) -> ToolResult:
         return ToolResult(
             ok=False,
             error=f"access denied: file must be under {DOCS_DIR.relative_to(PROJECT_ROOT)}",
+            meta=_prov("file", tainted=True, resolved_path=str(candidate)),
         )
 
     if not candidate.exists() or not candidate.is_file():
-        return ToolResult(ok=False, error="file not found")
+        return ToolResult(ok=False, error="file not found", meta=_prov("file", tainted=False, resolved_path=str(candidate)))
 
     try:
         content = candidate.read_text(encoding="utf-8", errors="ignore")
-        return ToolResult(ok=True, result=content[:max_chars])
+        return ToolResult(
+            ok=True,
+            result=content[: int(max_chars)],
+            meta=_prov("file", tainted=False, resolved_path=str(candidate), truncated=len(content) > int(max_chars)),
+        )
     except Exception as e:
-        return ToolResult(ok=False, error=str(e))
+        return ToolResult(ok=False, error=str(e), meta=_prov("file", tainted=False, resolved_path=str(candidate)))
 
 
 # ---------------------------------------------------------------------
-import sqlite3
-
-DB_PATH = (PROJECT_ROOT / "data" / "db" / "app.db").resolve()
-
+# Tool 3: run_sql(query)
+# ---------------------------------------------------------------------
 def run_sql(query: str, max_rows: int = 50) -> ToolResult:
     """
     Executes READ-ONLY SQL against a local SQLite database.
-    Used for stable demos and experiments.
     """
     if not query or not query.strip():
-        return ToolResult(ok=False, error="query is empty")
+        return ToolResult(ok=False, error="query is empty", meta=_prov("db", tainted=False, db=str(DB_PATH)))
 
     q = query.strip().rstrip(";")
     if not q.lower().lstrip().startswith("select"):
-        return ToolResult(ok=False, error="only SELECT queries are allowed")
+        return ToolResult(ok=False, error="only SELECT queries are allowed", meta=_prov("db", tainted=False, db=str(DB_PATH)))
 
     # Defensive LIMIT (simple check)
     if "limit" not in q.lower():
@@ -148,12 +161,13 @@ def run_sql(query: str, max_rows: int = 50) -> ToolResult:
             rows = cur.fetchmany(int(max_rows))
 
         result = [dict(zip(cols, r)) for r in rows]
-        return ToolResult(ok=True, result=result, meta={"row_count": len(result), "db": str(DB_PATH)})
-
+        return ToolResult(
+            ok=True,
+            result=result,
+            meta=_prov("db", tainted=False, row_count=len(result), db=str(DB_PATH)),
+        )
     except Exception as e:
-        return ToolResult(ok=False, error=str(e))
-
-
+        return ToolResult(ok=False, error=str(e), meta=_prov("db", tainted=False, db=str(DB_PATH)))
 
 
 # ---------------------------------------------------------------------
@@ -163,10 +177,9 @@ def send_email(to: str, subject: str, body: str) -> ToolResult:
     """
     MOCK email sender:
     Writes to logs/email.log instead of sending real email.
-    Useful for security experiments (exfiltration attempts).
     """
     if not to or "@" not in to:
-        return ToolResult(ok=False, error="invalid recipient")
+        return ToolResult(ok=False, error="invalid recipient", meta=_prov("egress", tainted=True, channel="email"))
 
     subject = subject or ""
     body = body or ""
@@ -184,9 +197,13 @@ def send_email(to: str, subject: str, body: str) -> ToolResult:
     try:
         with EMAIL_LOG.open("a", encoding="utf-8") as f:
             f.write(entry)
-        return ToolResult(ok=True, result={"logged_to": str(EMAIL_LOG.relative_to(PROJECT_ROOT))})
+        return ToolResult(
+            ok=True,
+            result={"logged_to": str(EMAIL_LOG.relative_to(PROJECT_ROOT))},
+            meta={"provenance": {"source": "egress", "channel": "email"}},
+        )
     except Exception as e:
-        return ToolResult(ok=False, error=str(e))
+        return ToolResult(ok=False, error=str(e), meta=_prov("egress", tainted=True, channel="email"))
 
 
 # ---------------------------------------------------------------------
@@ -199,49 +216,30 @@ def search_wikipedia(query: str, max_chars: int = 500) -> ToolResult:
     - Hard character limit
     - Marks output as tainted (untrusted external text)
     """
+    meta = _prov("web", tainted=True, subsource="wikipedia")
+
     if not query or not query.strip():
-        return ToolResult(ok=False, error="query is empty", meta={"tainted": True, "source": "wikipedia"})
+        return ToolResult(ok=False, error="query is empty", meta=meta)
 
     try:
         import wikipedia
-        wikipedia.set_lang("en")
 
+        wikipedia.set_lang("en")
         page = wikipedia.page(query.strip(), auto_suggest=False)
         summary = page.content.split("\n\n")[0].strip()
 
-        if len(summary) > max_chars:
-            summary = summary[:max_chars] + "..."
+        if len(summary) > int(max_chars):
+            summary = summary[: int(max_chars)] + "..."
 
-        return ToolResult(
-            ok=True,
-            result={"title": page.title, "text": summary},
-            meta={"tainted": True, "source": "wikipedia"},
-        )
-
-    except wikipedia.DisambiguationError as e:
-        return ToolResult(
-            ok=False,
-            error=f"Ambiguous query. Options: {e.options[:5]}",
-            meta={"tainted": True, "source": "wikipedia"},
-        )
-
-    except wikipedia.PageError:
-        return ToolResult(
-            ok=False,
-            error="Page not found",
-            meta={"tainted": True, "source": "wikipedia"},
-        )
+        return ToolResult(ok=True, result={"title": page.title, "text": summary}, meta=meta)
 
     except Exception as e:
-        return ToolResult(
-            ok=False,
-            error=str(e),
-            meta={"tainted": True, "source": "wikipedia"},
-        )
+        # Keep it simple: treat all wiki failures as tainted web errors
+        return ToolResult(ok=False, error=str(e), meta=meta)
 
 
 # ---------------------------------------------------------------------
-# Simple tool registry
+# Tool registry
 # ---------------------------------------------------------------------
 TOOLS: Dict[str, Callable[..., ToolResult]] = {
     "run_sql": run_sql,

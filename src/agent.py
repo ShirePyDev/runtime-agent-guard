@@ -15,25 +15,33 @@ class StepRecord:
     goal: str
     tool: str
     args: Dict[str, Any]
+
     decision: str
     reason: str
     risk_score: float
+    reason_codes: List[str] = field(default_factory=list)
+
+    # Tool execution results
     tool_ok: Optional[bool] = None
     tool_result: Optional[Any] = None
     tool_error: Optional[str] = None
     tool_meta: Dict[str, Any] = field(default_factory=dict)
+
+    # Monitor metadata (e.g., resolved path, sql risk level, etc.)
     monitor_meta: Dict[str, Any] = field(default_factory=dict)
 
-
+    # Approval tracking (ASK flow)
+    approved: Optional[bool] = None
+    approved_by: Optional[str] = None
 
 
 class SimpleRuntimeAgent:
     """
     Minimal agent runtime loop:
-    - Evaluates each proposed tool call with the runtime monitor BEFORE execution
-    - Enforces decisions: ALLOW / ASK / BLOCK
+    - Evaluate each proposed tool call with runtime monitor BEFORE execution
+    - Enforce decisions: ALLOW / ASK / BLOCK
     - Optionally supports human approval for ASK
-    - Logs a full, audit-friendly history for experiments / paper results
+    - Logs a full, audit-friendly history (paper-ready)
     """
 
     def __init__(self, goal: str, policy_mode: str = "balanced"):
@@ -41,6 +49,17 @@ class SimpleRuntimeAgent:
         self.monitor = TrustIntentMonitor()
         self.policy = get_policy(policy_mode)
         self.history: List[StepRecord] = []
+        self.session_state: Dict[str, Any] = {}
+
+    @staticmethod
+    def _sanitize_tool_args(tool_args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Remove monitor-only fields so tools don't accidentally depend on them.
+        """
+        exec_args = dict(tool_args or {})
+        exec_args.pop("tainted", None)
+        exec_args.pop("taint_sources", None)
+        return exec_args
 
     def _execute_tool(self, tool_name: str, tool_args: Dict[str, Any]) -> ToolResult:
         tool_fn = TOOLS.get(tool_name)
@@ -65,102 +84,149 @@ class SimpleRuntimeAgent:
 
         auto_confirm:
           - False = ASK stops unless a human approves (safe default)
-          - True  = treat ASK like ALLOW (debugging only)
+          - True  = treat ASK like ALLOW (debug/testing only)
         """
-        for i, action in enumerate(proposed_actions, start=1):
-            tool_name = str(action.get("tool", "")).strip()
-            tool_args = action.get("args", {}) or {}
+        try:
+            start_step = len(self.history) + 1
+            for i, action in enumerate(proposed_actions, start=start_step):
+                tool_name = str(action.get("tool", "")).strip()
+                tool_args = action.get("args", {}) or {}
 
-            # Convert history into simple dicts for the monitor (no StepRecord dependency)
-            history_for_monitor = [
-                {"tool": r.tool, "args": r.args, "decision": r.decision, "risk_score": r.risk_score}
-                for r in self.history
-            ]
-
-            md: MonitorDecision = self.monitor.evaluate(
-                goal=self.goal,
-                tool_name=tool_name,
-                tool_args=tool_args,
-                history=history_for_monitor,
-            )
-
-            record = StepRecord(
-                step=i,
-                goal=self.goal,
-                tool=tool_name,
-                args=tool_args,
-                decision=md.decision,
-                reason=md.reason,
-                risk_score=md.risk_score,
-                tool_meta={},
-                monitor_meta=md.metadata or {},
-            )
-
-            # -------------------------
-            # Enforce decision: BLOCK
-            # -------------------------
-            if md.decision == "BLOCK":
-                self.history.append(record)
-                break
-
-            # -------------------------
-            # Enforce decision: ASK
-            # -------------------------
-            if md.decision == "ASK" and not auto_confirm:
-                # Save the decision first (audit trail)
-                self.history.append(record)
-
-                if not interactive:
-                    # Safe stop in non-interactive mode
+                # -------------------------
+                # Early validation (clean + audit-friendly)
+                # -------------------------
+                if not tool_name:
+                    self.history.append(
+                        StepRecord(
+                            step=i,
+                            goal=self.goal,
+                            tool=tool_name,
+                            args=tool_args,
+                            decision="BLOCK",
+                            reason="Missing tool name.",
+                            risk_score=1.0,
+                            reason_codes=["MISSING_TOOL_NAME"],
+                        )
+                    )
                     break
 
-                print("\n=== APPROVAL REQUIRED ===")
-                print(f"Goal: {self.goal}")
-                print(f"Proposed tool: {tool_name}")
-                print(f"Arguments: {tool_args}")
-                print(f"Risk score: {md.risk_score}")
-                print(f"Reason: {md.reason}")
-                choice = input("Approve this action? (y/n): ").strip().lower()
-
-                if choice not in ("y", "yes"):
-                    # Denied: stop safely
+                if tool_name not in TOOLS:
+                    self.history.append(
+                        StepRecord(
+                            step=i,
+                            goal=self.goal,
+                            tool=tool_name,
+                            args=tool_args,
+                            decision="BLOCK",
+                            reason=f"Unknown tool: {tool_name}",
+                            risk_score=1.0,
+                            reason_codes=["UNKNOWN_TOOL"],
+                        )
+                    )
                     break
 
-                # Approved: execute tool ONCE and update the last record
-                # Strip monitor-only metadata before executing the tool
-                exec_args = dict(tool_args)
-                exec_args.pop("tainted", None)
-                exec_args.pop("taint_sources", None)
+                # Convert history into simple dicts for the monitor (no StepRecord dependency)
+                history_for_monitor = [
+                    {
+                        "tool": r.tool,
+                        "args": r.args,
+                        "decision": r.decision,
+                        "risk_score": r.risk_score,
+                    }
+                    for r in self.history
+                ]
 
+                md: MonitorDecision = self.monitor.evaluate(
+                    goal=self.goal,
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                    history=history_for_monitor,
+                    session_state=self.session_state,
+                )
+
+                record = StepRecord(
+                    step=i,
+                    goal=self.goal,
+                    tool=tool_name,
+                    args=tool_args,
+                    decision=md.decision,
+                    reason=md.reason,
+                    risk_score=md.risk_score,
+                    reason_codes=getattr(md, "reason_codes", []) or [],
+                    monitor_meta=getattr(md, "metadata", None) or {},
+                )
+
+                # -------------------------
+                # Enforce decision: BLOCK
+                # -------------------------
+                if md.decision == "BLOCK":
+                    self.history.append(record)
+                    break
+
+                # -------------------------
+                # Enforce decision: ASK
+                # -------------------------
+                if md.decision == "ASK" and not auto_confirm:
+                    self.history.append(record)
+
+                    if not interactive:
+                        # Safe stop in non-interactive mode
+                        record.approved = False
+                        record.approved_by = "non_interactive"
+                        break
+
+                    print("\n=== APPROVAL REQUIRED ===")
+                    print(f"Goal: {self.goal}")
+                    print(f"Proposed tool: {tool_name}")
+                    print(f"Arguments: {tool_args}")
+                    print(f"Risk score: {md.risk_score}")
+                    print(f"Reason: {md.reason}")
+                    choice = input("Approve this action? (y/n): ").strip().lower()
+
+                    if choice not in ("y", "yes"):
+                        record.approved = False
+                        record.approved_by = "human"
+                        break
+
+                    # Approved: execute tool ONCE and update the last record
+                    exec_args = self._sanitize_tool_args(tool_args)
+                    tool_result = self._execute_tool(tool_name, exec_args)
+
+                    last = self.history[-1]
+                    last.approved = True
+                    last.approved_by = "human"
+                    last.tool_ok = tool_result.ok
+                    last.tool_result = redact(tool_result.result, self.policy)
+                    last.tool_error = tool_result.error
+                    last.tool_meta = tool_result.meta or {}
+                    last.decision = "ALLOW"
+                    last.reason = f"{last.reason} (Approved by human)"
+
+                    # Move to next action
+                    continue
+
+                # -------------------------
+                # ALLOW (or ASK with auto_confirm)
+                # -------------------------
+                if md.decision == "ASK" and auto_confirm:
+                    record.approved = True
+                    record.approved_by = "auto_confirm"
+                    record.decision = "ALLOW"
+                    record.reason = f"{record.reason} (Auto-confirmed)"
+
+                exec_args = self._sanitize_tool_args(tool_args)
                 tool_result = self._execute_tool(tool_name, exec_args)
-                last = self.history[-1]
-                last.tool_ok = tool_result.ok
-                last.tool_result = redact(tool_result.result, self.policy)
-                last.tool_error = tool_result.error
-                last.tool_meta = tool_result.meta or {}
-                last.decision = "ALLOW"
-                last.reason = f"{last.reason} (Approved by human)"
 
-                # Move to next action (do NOT fall through and run again)
-                continue
+                record.tool_ok = tool_result.ok
+                record.tool_result = redact(tool_result.result, self.policy)
+                record.tool_error = tool_result.error
+                record.tool_meta = tool_result.meta or {}
 
-            # -------------------------
-            # ALLOW (or ASK with auto_confirm)
-            # -------------------------
-            # Strip monitor-only metadata before executing the tool
-            # Strip monitor-only metadata before executing the tool
-            exec_args = dict(tool_args)
-            exec_args.pop("tainted", None)
-            exec_args.pop("taint_sources", None)
+                self.history.append(record)
 
-            tool_result = self._execute_tool(tool_name, exec_args)
-            record.tool_ok = tool_result.ok
-            record.tool_result = redact(tool_result.result, self.policy)
-            record.tool_error = tool_result.error
-            record.tool_meta = tool_result.meta or {}
+            return self.history
 
-            self.history.append(record)
-
-        # Save full runtime trace to JSON
-        save_run(self.history, self.goal)
-        return self.history
+        finally:
+            # Always save full runtime trace (even on crashes)
+            save_run(self.history, self.goal)
+            

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,9 +12,6 @@ from src.sql_policy import assess_sql_risk
 Decision = Literal["ALLOW", "ASK", "BLOCK"]
 
 
-# --------------------------
-# Decision container
-# --------------------------
 @dataclass
 class MonitorDecision:
     decision: Decision
@@ -22,18 +21,15 @@ class MonitorDecision:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-# --------------------------
-# Runtime Monitor
-# --------------------------
 class TrustIntentMonitor:
     """
-    Runtime guard (v2):
-    - Tool-specific intent similarity
-    - Path traversal defense
-    - SQL schema-aware risk checks
-    - Email exfiltration detection
-    - History-based escalation
-    - Structured audit metadata
+    Runtime guard:
+    - Tool-specific checks (file, SQL, email, web)
+    - Intent drift detection (goal vs action)
+    - Repetition escalation (ASK/BLOCK loops)
+    - Session risk budget
+    - Provenance/taint handling (direct + inferred)
+    - Structured audit metadata (args_hash, previews)
     """
 
     _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -48,8 +44,13 @@ class TrustIntentMonitor:
         ]
 
         self.exfil_keywords = [
-            "all users", "dump", "export", "send everything",
-            "entire database", "full list",
+            "all users",
+            "dump",
+            "export",
+            "send everything",
+            "entire database",
+            "full list",
+            "full user list",
         ]
 
         self.tool_sensitivity = {
@@ -61,7 +62,17 @@ class TrustIntentMonitor:
         }
 
         self.known_tools = set(self.tool_sensitivity.keys())
+
+        # If non-empty => any external domain not in allowlist -> ASK
         self.email_domain_allowlist: Set[str] = set()
+
+        # Session risk budget defaults
+        self.default_risk_budget: float = 1.5
+        self.risk_budget_ask_threshold: float = 0.2
+        self.risk_budget_block_threshold: float = -0.5
+
+        # Taint inference window
+        self.taint_history_window: int = 8
 
     # --------------------------
     # Tokenization + similarity
@@ -108,6 +119,29 @@ class TrustIntentMonitor:
         )
 
     # --------------------------
+    # Audit helpers
+    # --------------------------
+    def _args_hash(self, tool_args: Dict[str, Any]) -> str:
+        try:
+            s = json.dumps(tool_args or {}, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:
+            s = str(tool_args)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:16]
+
+    def _attach_audit_defaults(
+        self,
+        decision: MonitorDecision,
+        goal: str,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+    ) -> MonitorDecision:
+        decision.metadata.setdefault("tool", tool_name)
+        decision.metadata.setdefault("args_hash", self._args_hash(tool_args))
+        decision.metadata.setdefault("args_preview", self._action_text(tool_name, tool_args))
+        decision.metadata.setdefault("goal_preview", self._safe_preview(goal, 200))
+        return decision
+
+    # --------------------------
     # History-based escalation
     # --------------------------
     def _count_recent_decisions(
@@ -118,10 +152,13 @@ class TrustIntentMonitor:
         window: int = 6,
     ) -> int:
         recent = history[-window:] if history else []
-        return sum(
-            1 for h in recent
-            if h.get("tool") == tool_name and h.get("decision") == decision
-        )
+        count = 0
+        for h in recent:
+            t = h.get("tool") or h.get("tool_name") or h.get("action") or h.get("name")
+            d = h.get("decision")
+            if t == tool_name and d == decision:
+                count += 1
+        return count
 
     def _escalate_if_repeated(
         self,
@@ -144,6 +181,61 @@ class TrustIntentMonitor:
         return base
 
     # --------------------------
+    # Session risk budget
+    # --------------------------
+    def _apply_risk_budget(
+        self,
+        base: MonitorDecision,
+        session_state: Dict[str, Any],
+    ) -> MonitorDecision:
+        budget = float(session_state.get("risk_budget", self.default_risk_budget))
+        budget -= float(base.risk_score)
+        session_state["risk_budget"] = budget
+        base.metadata["risk_budget"] = round(budget, 3)
+
+        if budget < self.risk_budget_block_threshold:
+            if base.decision != "BLOCK":
+                base.decision = "BLOCK"
+                base.reason_codes.append("RISK_BUDGET_EXHAUSTED")
+                base.risk_score = max(base.risk_score, 0.95)
+                base.reason = "Session risk budget exhausted. Blocking further high-risk actions."
+            return base
+
+        if budget < self.risk_budget_ask_threshold and base.decision == "ALLOW":
+            base.decision = "ASK"
+            base.reason_codes.append("RISK_BUDGET_LOW_ESCALATE")
+            base.risk_score = max(base.risk_score, 0.6)
+            base.reason = "Session risk budget is low. Confirm before continuing."
+
+        return base
+
+    # --------------------------
+    # Provenance / taint inference
+    # --------------------------
+    def _extract_provenance(self, history_item: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Support multiple shapes to avoid breaking when agent formats history differently.
+        """
+        md = (
+            history_item.get("metadata")
+            or history_item.get("monitor_meta")
+            or history_item.get("monitor_metadata")
+            or {}
+        )
+        prov = md.get("provenance") or {}
+        return prov if isinstance(prov, dict) else {}
+
+    def _infer_taint_from_history(self, history: List[Dict[str, Any]]) -> bool:
+        if not history:
+            return False
+        recent = history[-self.taint_history_window :]
+        for h in reversed(recent):
+            prov = self._extract_provenance(h)
+            if prov.get("tainted") is True:
+                return True
+        return False
+
+    # --------------------------
     # Main decision function
     # --------------------------
     def evaluate(
@@ -152,62 +244,62 @@ class TrustIntentMonitor:
         tool_name: str,
         tool_args: Dict[str, Any],
         history: Optional[List[Dict[str, Any]]] = None,
+        session_state: Optional[Dict[str, Any]] = None,
     ) -> MonitorDecision:
         goal_l = (goal or "").lower()
         tool_name = (tool_name or "").strip()
         tool_args = tool_args or {}
         history = history or []
+        session_state = session_state if session_state is not None else {}
 
-        # Unknown tool
+        # Unknown tool (monitor-level behavior)
         if tool_name not in self.known_tools:
-            return MonitorDecision(
+            d = MonitorDecision(
                 decision="ASK",
                 reason=f"Unknown tool '{tool_name}'. Confirm before execution.",
                 risk_score=0.6,
                 reason_codes=["UNKNOWN_TOOL"],
-                metadata={"tool": tool_name},
+                metadata={"provenance": {"source": "unknown", "tainted": True}},
             )
+            d = self._attach_audit_defaults(d, goal, tool_name, tool_args)
+            return self._apply_risk_budget(d, session_state)
 
-        # Tool-specific handlers
         if tool_name == "read_file":
-            return self._escalate_if_repeated(
-                self._handle_read_file(tool_args), tool_name, history
-            )
+            d = self._handle_read_file(tool_args)
+        elif tool_name == "search_wikipedia":
+            d = self._handle_search_wikipedia(tool_args)
+        elif tool_name == "run_sql":
+            d = self._handle_run_sql(goal, tool_args)
+        elif tool_name == "send_email":
+            d = self._handle_send_email(goal_l, tool_args, history)
+        else:
+            # Low-risk default handler + drift check
+            sim = self.intent_similarity(goal, tool_name, tool_args)
+            drift = 1.0 - sim
+            if drift >= 0.85:
+                d = MonitorDecision(
+                    decision="ASK",
+                    reason=f"Possible intent drift (similarity={sim:.2f}). Confirm.",
+                    risk_score=0.5,
+                    reason_codes=["INTENT_DRIFT_ASK"],
+                    metadata={
+                        "similarity": round(sim, 3),
+                        "drift": round(drift, 3),
+                        "provenance": {"source": "internal", "tainted": False},
+                    },
+                )
+            else:
+                d = MonitorDecision(
+                    decision="ALLOW",
+                    reason="Action allowed.",
+                    risk_score=0.2,
+                    reason_codes=["DEFAULT_ALLOW"],
+                    metadata={"provenance": {"source": "internal", "tainted": False}},
+                )
 
-        if tool_name == "search_wikipedia":
-            return self._escalate_if_repeated(
-                self._handle_search_wikipedia(tool_args), tool_name, history
-            )
-
-        if tool_name == "run_sql":
-            return self._escalate_if_repeated(
-                self._handle_run_sql(goal, tool_args), tool_name, history
-            )
-
-        if tool_name == "send_email":
-            return self._escalate_if_repeated(
-                self._handle_send_email(goal_l, tool_args), tool_name, history
-            )
-
-        # Drift check (low-risk tools)
-        sim = self.intent_similarity(goal, tool_name, tool_args)
-        drift = 1.0 - sim
-
-        if drift >= 0.85:
-            return MonitorDecision(
-                decision="ASK",
-                reason=f"Possible intent drift (similarity={sim:.2f}). Confirm.",
-                risk_score=0.5,
-                reason_codes=["INTENT_DRIFT_ASK"],
-                metadata={"similarity": round(sim, 3), "drift": round(drift, 3)},
-            )
-
-        return MonitorDecision(
-            decision="ALLOW",
-            reason="Action allowed.",
-            risk_score=0.2,
-            reason_codes=["DEFAULT_ALLOW"],
-        )
+        d = self._escalate_if_repeated(d, tool_name, history)
+        d = self._attach_audit_defaults(d, goal, tool_name, tool_args)
+        return self._apply_risk_budget(d, session_state)
 
     # --------------------------
     # Handlers
@@ -215,12 +307,24 @@ class TrustIntentMonitor:
     def _handle_read_file(self, tool_args: Dict[str, Any]) -> MonitorDecision:
         raw = str(tool_args.get("path", "")).strip()
         if not raw:
-            return MonitorDecision("ASK", "Missing file path.", 0.5, ["MISSING_PATH"])
+            return MonitorDecision(
+                "ASK",
+                "Missing file path.",
+                0.5,
+                ["MISSING_PATH"],
+                {"provenance": {"source": "file", "tainted": False}},
+            )
 
         try:
             resolved = Path(raw).expanduser().resolve()
         except Exception:
-            return MonitorDecision("BLOCK", "Invalid file path.", 1.0, ["INVALID_PATH"])
+            return MonitorDecision(
+                "BLOCK",
+                "Invalid file path.",
+                1.0,
+                ["INVALID_PATH"],
+                {"provenance": {"source": "file", "tainted": True}},
+            )
 
         try:
             inside = resolved.is_relative_to(self.allowed_docs_base)
@@ -233,7 +337,7 @@ class TrustIntentMonitor:
                 "File access outside allowed directory.",
                 1.0,
                 ["FILE_OUTSIDE_ALLOWED_DIR"],
-                {"resolved_path": str(resolved)},
+                {"resolved_path": str(resolved), "provenance": {"source": "file", "tainted": True}},
             )
 
         return MonitorDecision(
@@ -241,25 +345,38 @@ class TrustIntentMonitor:
             "Reading from allowed docs directory.",
             0.1,
             ["FILE_ALLOWED"],
-            {"resolved_path": str(resolved)},
+            {"resolved_path": str(resolved), "provenance": {"source": "file", "tainted": False}},
         )
 
     def _handle_search_wikipedia(self, tool_args: Dict[str, Any]) -> MonitorDecision:
         q = str(tool_args.get("query", "")).strip()
         if len(q) < 3:
-            return MonitorDecision("ASK", "Wikipedia query too vague.", 0.4, ["WIKI_QUERY_VAGUE"])
+            return MonitorDecision(
+                "ASK",
+                "Wikipedia query too vague.",
+                0.4,
+                ["WIKI_QUERY_VAGUE"],
+                {"provenance": {"source": "web", "tainted": True}},
+            )
 
         return MonitorDecision(
             "ALLOW",
             "Wikipedia search allowed (tainted output).",
             0.3,
             ["WIKI_ALLOWED_TAINTED"],
+            {"provenance": {"source": "web", "tainted": True}},
         )
 
     def _handle_run_sql(self, goal: str, tool_args: Dict[str, Any]) -> MonitorDecision:
         query = str(tool_args.get("query", "")).strip()
         if not query:
-            return MonitorDecision("ASK", "Missing SQL query.", 0.5, ["MISSING_SQL_QUERY"])
+            return MonitorDecision(
+                "ASK",
+                "Missing SQL query.",
+                0.5,
+                ["MISSING_SQL_QUERY"],
+                {"provenance": {"source": "db", "tainted": False}},
+            )
 
         risk = assess_sql_risk(query, goal)
 
@@ -269,48 +386,109 @@ class TrustIntentMonitor:
                 "SQL SELECT without LIMIT.",
                 max(0.6, float(risk.score)),
                 ["SQL_MISSING_LIMIT"],
-                {"sql_risk_level": risk.level},
+                {"sql_risk_level": risk.level, "provenance": {"source": "db", "tainted": False}},
             )
 
         if risk.level == "CRITICAL":
-            return MonitorDecision("BLOCK", risk.reason, risk.score, ["SQL_CRITICAL"])
+            return MonitorDecision(
+                "BLOCK",
+                risk.reason,
+                risk.score,
+                ["SQL_CRITICAL"],
+                {"sql_risk_level": risk.level, "provenance": {"source": "db", "tainted": False}},
+            )
 
         if risk.level in ("HIGH", "MEDIUM"):
-            return MonitorDecision("ASK", risk.reason, risk.score, [f"SQL_{risk.level}"])
+            return MonitorDecision(
+                "ASK",
+                risk.reason,
+                risk.score,
+                [f"SQL_{risk.level}"],
+                {"sql_risk_level": risk.level, "provenance": {"source": "db", "tainted": False}},
+            )
 
         return MonitorDecision(
             "ALLOW",
             "SQL approved.",
             0.2,
             ["SQL_LOW"],
-            {"sql_risk_level": risk.level},
+            {"sql_risk_level": risk.level, "provenance": {"source": "db", "tainted": False}},
         )
 
-    def _handle_send_email(self, goal_l: str, tool_args: Dict[str, Any]) -> MonitorDecision:
-        body = str(tool_args.get("body", "")).lower()
+    def _handle_send_email(
+        self,
+        goal_l: str,
+        tool_args: Dict[str, Any],
+        history: List[Dict[str, Any]],
+    ) -> MonitorDecision:
+        to_raw = str(tool_args.get("to", "")).strip()
+        subject_raw = str(tool_args.get("subject", "")).strip()
+        body_raw = str(tool_args.get("body", "")).strip()
 
-        if tool_args.get("tainted"):
-            return MonitorDecision(
-                "ASK",
-                "Email contains untrusted external content.",
-                0.7,
-                ["EMAIL_TAINTED_CONTENT"],
-            )
+        to_l = to_raw.lower()
+        subject_l = subject_raw.lower()
+        body_l = body_raw.lower()
 
-        if any(k in body for k in self.sensitive_keywords):
+        combined = f"{subject_l}\n{body_l}"
+
+        # 1) HARD BLOCKS first (regardless of goal)
+        if any(k in combined for k in self.sensitive_keywords):
             return MonitorDecision(
                 "BLOCK",
                 "Email contains credential-like content.",
                 1.0,
                 ["EMAIL_CONTAINS_SECRETS"],
+                {"provenance": {"source": "egress", "tainted": True}},
             )
 
-        if any(k in body for k in self.exfil_keywords):
+        if any(k in combined for k in self.exfil_keywords):
             return MonitorDecision(
                 "BLOCK",
                 "Email appears to exfiltrate data.",
                 1.0,
                 ["EMAIL_EXFIL_PATTERN"],
+                {"provenance": {"source": "egress", "tainted": True}},
+            )
+
+        # 2) Goal alignment (ASK)
+        email_intent_terms = ("email", "send", "mail", "message", "share", "forward", "notify", "report")
+        if not any(t in goal_l for t in email_intent_terms):
+            return MonitorDecision(
+                "ASK",
+                "Goal does not indicate sending an email. Confirm before sending.",
+                0.6,
+                ["EMAIL_NOT_IN_GOAL"],
+                {"provenance": {"source": "egress", "tainted": True}},
+            )
+
+        # 3) Domain allowlist gating (ASK)
+        if self.email_domain_allowlist:
+            domain = ""
+            if "@" in to_l:
+                domain = to_l.split("@", 1)[-1].strip()
+            if not domain or domain not in self.email_domain_allowlist:
+                return MonitorDecision(
+                    "ASK",
+                    "Recipient domain not allowlisted. Confirm before sending.",
+                    0.8,
+                    ["EMAIL_DOMAIN_NOT_ALLOWED"],
+                    {"domain": domain, "provenance": {"source": "egress", "tainted": True}},
+                )
+
+        # 4) Taint (ASK)
+        tainted_flag = bool(tool_args.get("tainted"))
+        tainted_inferred = self._infer_taint_from_history(history)
+        if tainted_flag or tainted_inferred:
+            return MonitorDecision(
+                "ASK",
+                "Email contains untrusted external content (tainted).",
+                0.7,
+                ["EMAIL_TAINTED_CONTENT"],
+                {
+                    "tainted_flag": tainted_flag,
+                    "tainted_inferred": tainted_inferred,
+                    "provenance": {"source": "egress", "tainted": True},
+                },
             )
 
         return MonitorDecision(
@@ -318,4 +496,5 @@ class TrustIntentMonitor:
             "Email appears safe.",
             0.3,
             ["EMAIL_ALLOWED"],
+            {"provenance": {"source": "egress", "tainted": False}},
         )
