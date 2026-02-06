@@ -126,15 +126,28 @@ class SimpleRuntimeAgent:
                     break
 
                 # Convert history into simple dicts for the monitor (no StepRecord dependency)
-                history_for_monitor = [
-                    {
+                history_for_monitor = []
+                for r in self.history:
+                    merged_meta = {}
+
+                    if isinstance(getattr(r, "monitor_meta", None), dict):
+                        merged_meta.update(r.monitor_meta)
+
+                    # Ensure provenance is a dict; if missing/bad, fall back to tool_meta provenance
+                    prov = merged_meta.get("provenance")
+                    if not isinstance(prov, dict):
+                        tool_meta = getattr(r, "tool_meta", None)
+                        if isinstance(tool_meta, dict) and isinstance(tool_meta.get("provenance"), dict):
+                            merged_meta["provenance"] = tool_meta["provenance"]
+
+                    history_for_monitor.append({
                         "tool": r.tool,
                         "args": r.args,
                         "decision": r.decision,
                         "risk_score": r.risk_score,
-                    }
-                    for r in self.history
-                ]
+                        "reason_codes": getattr(r, "reason_codes", None),
+                        "monitor_meta": merged_meta,
+                    })
 
                 md: MonitorDecision = self.monitor.evaluate(
                     goal=self.goal,
