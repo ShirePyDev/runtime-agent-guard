@@ -7,7 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set
 
-from src.sql_policy import assess_sql_risk
+from src.classification import DataClassifier
+from src.signals import RiskSignals, classify_sql_entities
+from src.sql_policy import extract_tables_and_columns
 
 Decision = Literal["ALLOW", "ASK", "BLOCK"]
 
@@ -35,13 +37,29 @@ class TrustIntentMonitor:
     _WORD_RE = re.compile(r"[a-z0-9]+")
     _MANY_ROWS_RE = re.compile(r"(\n.*?,.*?){10,}", re.DOTALL)
 
-    def __init__(self, allowed_docs_dir: str = "data/docs") -> None:
+    def __init__(self, allowed_docs_dir: str = "data/docs", policy_mode: str = "balanced") -> None:
         self.allowed_docs_base = Path(allowed_docs_dir).resolve()
+
+        # balanced (default) | strict
+        self.policy_mode = (policy_mode or "balanced").lower().strip()
 
         self.sensitive_keywords = [
             "password", "api key", "apikey", "secret", "token",
             "private key", "ssh", "credential",
         ]
+        # Detect common secret/token formats (beyond keywords)
+        self.secret_regexes = [
+            re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"),          # GitHub classic PAT
+            re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),  # GitHub fine-grained PAT
+            re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"),           # common API key pattern (generic)
+            re.compile(r"\bAKIA[0-9A-Z]{16}\b"),              # AWS Access Key ID
+            re.compile(r"-----BEGIN (?:RSA |EC |)PRIVATE KEY-----"),
+            re.compile(
+                r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+            ),  # JWT-like
+        ]
+
+        self.classifier = DataClassifier()
 
         self.exfil_keywords = [
             "all users",
@@ -73,6 +91,33 @@ class TrustIntentMonitor:
 
         # Taint inference window
         self.taint_history_window: int = 8
+
+    # --------------------------
+    # SQL signals
+    # --------------------------
+    def _build_signals_for_sql(self, goal: str, query: str, tainted_input: bool) -> RiskSignals:
+        tables, columns, parsed_ok = extract_tables_and_columns(query)
+
+        sig = RiskSignals(tool_name="run_sql", operation="query", goal=goal)
+        sig.tables = tables
+        sig.columns = columns
+        sig.tainted_input = tainted_input
+
+        # Keep your existing heuristics
+        q_lower = query.strip().lower()
+        sig.missing_limit = q_lower.startswith("select") and "limit" not in q_lower
+        sig.bulk_indicator = sig.missing_limit
+
+        # This is the sensitivity classifier (expects classifier, tables, columns)
+        sig.sensitivity_hits = classify_sql_entities(self.classifier, tables, columns)
+
+        # Optional: bump if missing limit
+        if sig.missing_limit:
+            sig.base_score = max(sig.base_score, 0.7)
+            sig.reasons.append("SQL_MISSING_LIMIT")
+
+        sig.finalize()
+        return sig
 
     # --------------------------
     # Tokenization + similarity
@@ -173,7 +218,6 @@ class TrustIntentMonitor:
             base.reason_codes.append("REPEATED_BLOCKS")
             base.risk_score = max(base.risk_score, 0.95)
             base.decision = "BLOCK"
-
         elif asks >= 3 and base.decision == "ASK":
             base.reason_codes.append("REPEATED_ASKS")
             base.risk_score = max(base.risk_score, 0.75)
@@ -213,9 +257,6 @@ class TrustIntentMonitor:
     # Provenance / taint inference
     # --------------------------
     def _extract_provenance(self, history_item: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Support multiple shapes to avoid breaking when agent formats history differently.
-        """
         md = (
             history_item.get("metadata")
             or history_item.get("monitor_meta")
@@ -228,7 +269,7 @@ class TrustIntentMonitor:
     def _infer_taint_from_history(self, history: List[Dict[str, Any]]) -> bool:
         if not history:
             return False
-        recent = history[-self.taint_history_window :]
+        recent = history[-self.taint_history_window:]
         for h in reversed(recent):
             prov = self._extract_provenance(h)
             if prov.get("tainted") is True:
@@ -252,7 +293,7 @@ class TrustIntentMonitor:
         history = history or []
         session_state = session_state if session_state is not None else {}
 
-        # Unknown tool (monitor-level behavior)
+        # Unknown tool
         if tool_name not in self.known_tools:
             d = MonitorDecision(
                 decision="ASK",
@@ -271,9 +312,9 @@ class TrustIntentMonitor:
         elif tool_name == "run_sql":
             d = self._handle_run_sql(goal, tool_args)
         elif tool_name == "send_email":
-            d = self._handle_send_email(goal_l, tool_args, history)
+            # ✅ PASS session_state (required for multi-step rule)
+            d = self._handle_send_email(goal_l, tool_args, history, session_state)
         else:
-            # Low-risk default handler + drift check
             sim = self.intent_similarity(goal, tool_name, tool_args)
             drift = 1.0 - sim
             if drift >= 0.85:
@@ -375,44 +416,90 @@ class TrustIntentMonitor:
                 "Missing SQL query.",
                 0.5,
                 ["MISSING_SQL_QUERY"],
-                {"provenance": {"source": "db", "tainted": False}},
+                {
+                    "classified_hit": False,
+                    "classified_keys": [],
+                    "provenance": {"source": "db", "tainted": False},
+                },
             )
 
-        risk = assess_sql_risk(query, goal)
+        sig = self._build_signals_for_sql(goal=goal, query=query, tainted_input=False)
 
-        if query.lower().startswith("select") and " limit " not in f" {query.lower()} ":
-            return MonitorDecision(
-                "ASK",
-                "SQL SELECT without LIMIT.",
-                max(0.6, float(risk.score)),
-                ["SQL_MISSING_LIMIT"],
-                {"sql_risk_level": risk.level, "provenance": {"source": "db", "tainted": False}},
-            )
+        # Extract classified keys safely
+        classified_keys = [getattr(h, "key", str(h)) for h in (sig.sensitivity_hits or [])]
+        classified_hit = bool(classified_keys)
+        policy_mode = getattr(self, "policy_mode", "balanced")
 
-        if risk.level == "CRITICAL":
+        meta = {
+            "signals": {
+                "tables": sig.tables,
+                "columns": sig.columns,
+                "missing_limit": sig.missing_limit,
+            },
+            "classified_hit": classified_hit,
+            "classified_keys": classified_keys,
+            "provenance": {"source": "db", "tainted": False},
+        }
+
+        # --------------------------
+        # (1) STRICT MODE: any classified SQL is BLOCK
+        # --------------------------
+        if policy_mode == "strict" and classified_hit:
             return MonitorDecision(
                 "BLOCK",
-                risk.reason,
-                risk.score,
-                ["SQL_CRITICAL"],
-                {"sql_risk_level": risk.level, "provenance": {"source": "db", "tainted": False}},
+                f"Strict mode: blocked classified SQL access: {classified_keys}",
+                float(max(sig.base_score, 0.9)),
+                ["SQL_CLASSIFIED_BLOCK_STRICT"],
+                meta,
             )
 
-        if risk.level in ("HIGH", "MEDIUM"):
+        # --------------------------
+        # (2) CRITICAL classified access (both modes)
+        # --------------------------
+        if sig.base_score >= 0.9:
+            return MonitorDecision(
+                "BLOCK",
+                f"SQL access to critical classified data: {classified_keys}",
+                float(sig.base_score),
+                ["SQL_CRITICAL_CLASSIFIED"],
+                meta,
+            )
+
+        # --------------------------
+        # (3) ASK for classified OR missing LIMIT (balanced)
+        # --------------------------
+        if sig.base_score >= 0.6 or sig.missing_limit:
+            reason_bits = []
+            if classified_hit:
+                reason_bits.append(f"classified={classified_keys}")
+            if sig.missing_limit:
+                reason_bits.append("missing_limit=True")
+
+            reason = "SQL requires confirmation (" + ", ".join(reason_bits) + ")."
+
+            reason_codes = []
+            if classified_hit:
+                reason_codes.append("SQL_CLASSIFIED_ASK")
+            if sig.missing_limit:
+                reason_codes.append("SQL_MISSING_LIMIT")
+
             return MonitorDecision(
                 "ASK",
-                risk.reason,
-                risk.score,
-                [f"SQL_{risk.level}"],
-                {"sql_risk_level": risk.level, "provenance": {"source": "db", "tainted": False}},
+                reason,
+                float(max(0.6, sig.base_score)),
+                reason_codes,
+                meta,
             )
 
+        # --------------------------
+        # (4) LOW risk SQL
+        # --------------------------
         return MonitorDecision(
             "ALLOW",
-            "SQL approved.",
+            "SQL approved (no classified data detected).",
             0.2,
             ["SQL_LOW"],
-            {"sql_risk_level": risk.level, "provenance": {"source": "db", "tainted": False}},
+            meta,
         )
 
     def _handle_send_email(
@@ -420,6 +507,7 @@ class TrustIntentMonitor:
         goal_l: str,
         tool_args: Dict[str, Any],
         history: List[Dict[str, Any]],
+        session_state: Dict[str, Any],
     ) -> MonitorDecision:
         to_raw = str(tool_args.get("to", "")).strip()
         subject_raw = str(tool_args.get("subject", "")).strip()
@@ -431,14 +519,31 @@ class TrustIntentMonitor:
 
         combined = f"{subject_l}\n{body_l}"
 
+        # 0) Basic validation (ASK)
+        if not to_raw or "@" not in to_raw:
+            return MonitorDecision(
+                "ASK",
+                "Missing or invalid recipient address. Confirm before sending.",
+                0.5,
+                ["EMAIL_INVALID_RECIPIENT"],
+                {"provenance": {"source": "egress", "tainted": True}},
+            )
+
         # 1) HARD BLOCKS first (regardless of goal)
-        if any(k in combined for k in self.sensitive_keywords):
+        contains_keyword_secret = any(k in combined for k in self.sensitive_keywords)
+        contains_regex_secret = any(r.search(combined) for r in getattr(self, "secret_regexes", []))
+
+        if contains_keyword_secret or contains_regex_secret:
             return MonitorDecision(
                 "BLOCK",
                 "Email contains credential-like content.",
                 1.0,
                 ["EMAIL_CONTAINS_SECRETS"],
-                {"provenance": {"source": "egress", "tainted": True}},
+                {
+                    "contains_keyword_secret": contains_keyword_secret,
+                    "contains_regex_secret": contains_regex_secret,
+                    "provenance": {"source": "egress", "tainted": True},
+                },
             )
 
         if any(k in combined for k in self.exfil_keywords):
@@ -450,7 +555,33 @@ class TrustIntentMonitor:
                 {"provenance": {"source": "egress", "tainted": True}},
             )
 
-        # 2) Goal alignment (ASK)
+        # 2) MULTI-STEP RULE (STRICT/BALANCED)
+        # If classified DB access happened earlier in this session, egress must be controlled.
+        if session_state.get("classified_accessed") is True:
+            if getattr(self, "policy_mode", "balanced") == "strict":
+                return MonitorDecision(
+                    "BLOCK",
+                    "Blocked egress because classified data was accessed earlier in this session (strict mode).",
+                    1.0,
+                    ["EGRESS_AFTER_CLASSIFIED_BLOCK"],
+                    {
+                        "classified_sources": session_state.get("classified_sources", []),
+                        "provenance": {"source": "egress", "tainted": True},
+                    },
+                )
+            else:
+                return MonitorDecision(
+                    "ASK",
+                    "Egress requires confirmation because classified data was accessed earlier in this session.",
+                    0.85,
+                    ["EGRESS_AFTER_CLASSIFIED_ASK"],
+                    {
+                        "classified_sources": session_state.get("classified_sources", []),
+                        "provenance": {"source": "egress", "tainted": True},
+                    },
+                )
+
+        # 3) Goal alignment (ASK)
         email_intent_terms = ("email", "send", "mail", "message", "share", "forward", "notify", "report")
         if not any(t in goal_l for t in email_intent_terms):
             return MonitorDecision(
@@ -461,11 +592,9 @@ class TrustIntentMonitor:
                 {"provenance": {"source": "egress", "tainted": True}},
             )
 
-        # 3) Domain allowlist gating (ASK)
+        # 4) Domain allowlist gating (ASK) — if allowlist is set
         if self.email_domain_allowlist:
-            domain = ""
-            if "@" in to_l:
-                domain = to_l.split("@", 1)[-1].strip()
+            domain = to_l.split("@", 1)[-1].strip() if "@" in to_l else ""
             if not domain or domain not in self.email_domain_allowlist:
                 return MonitorDecision(
                     "ASK",
@@ -475,7 +604,7 @@ class TrustIntentMonitor:
                     {"domain": domain, "provenance": {"source": "egress", "tainted": True}},
                 )
 
-        # 4) Taint (ASK)
+        # 5) Taint (ASK)
         tainted_flag = bool(tool_args.get("tainted"))
         tainted_inferred = self._infer_taint_from_history(history)
         if tainted_flag or tainted_inferred:
@@ -492,9 +621,9 @@ class TrustIntentMonitor:
             )
 
         return MonitorDecision(
-            "ALLOW",
-            "Email appears safe.",
-            0.3,
-            ["EMAIL_ALLOWED"],
-            {"provenance": {"source": "egress", "tainted": False}},
+            "ASK",
+            "Email sending requires confirmation (egress control).",
+            0.6,
+            ["EMAIL_EGRESS_CONFIRM_DEFAULT"],
+            {"provenance": {"source": "egress", "tainted": True}},
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
-
+from .classification import DataClassifier
+from .signals import classify_sql_entities
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple
 
@@ -26,7 +27,7 @@ SENSITIVE_TABLES: Dict[str, float] = {
 }
 
 SENSITIVE_COLUMNS: Dict[Tuple[str, str], float] = {
-    ("users", "email"): 0.9,
+    ("users", "email"): 1.0,     # was 0.9
     ("api_keys", "api_key"): 1.0,
 }
 
