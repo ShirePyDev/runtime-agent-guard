@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from email.mime import base
 import hashlib
 import json
 import re
@@ -10,6 +11,12 @@ from typing import Any, Dict, List, Literal, Optional, Set
 from src.classification import DataClassifier
 from src.signals import RiskSignals, classify_sql_entities
 from src.sql_policy import extract_tables_and_columns
+
+# --- Global thresholds (Step 3: hard block at high risk) ---
+HIGH_RISK_BLOCK = 0.90          # >= this => always BLOCK (no human override)
+ASK_THRESHOLD = 0.60            # >= this => ASK (unless high-risk block)
+RISK_BUDGET_START = 1.00        # starting budget (optional; used below)
+
 
 Decision = Literal["ALLOW", "ASK", "BLOCK"]
 
@@ -85,7 +92,8 @@ class TrustIntentMonitor:
         self.email_domain_allowlist: Set[str] = set()
 
         # Session risk budget defaults
-        self.default_risk_budget: float = 1.5
+        # NOTE: use RISK_BUDGET_START as a sane default
+        self.default_risk_budget: float = float(RISK_BUDGET_START)
         self.risk_budget_ask_threshold: float = 0.2
         self.risk_budget_block_threshold: float = -0.5
 
@@ -187,6 +195,22 @@ class TrustIntentMonitor:
         return decision
 
     # --------------------------
+    # Step 3: High-risk hard block (global, no override)
+    # --------------------------
+    def _enforce_high_risk_hard_block(self, d: MonitorDecision) -> MonitorDecision:
+        # If it's already BLOCK, keep it.
+        if d.decision == "BLOCK":
+            return d
+
+        # If the risk is above the global hard-block threshold => BLOCK.
+        if float(d.risk_score) >= float(HIGH_RISK_BLOCK):
+            d.decision = "BLOCK"
+            d.reason_codes.append("HIGH_RISK_HARD_BLOCK")
+            d.reason = f"{d.reason} (High-risk hard block)"
+            d.risk_score = max(float(d.risk_score), float(HIGH_RISK_BLOCK))
+        return d
+
+    # --------------------------
     # History-based escalation
     # --------------------------
     def _count_recent_decisions(
@@ -200,8 +224,8 @@ class TrustIntentMonitor:
         count = 0
         for h in recent:
             t = h.get("tool") or h.get("tool_name") or h.get("action") or h.get("name")
-            d = h.get("decision")
-            if t == tool_name and d == decision:
+            dd = h.get("decision")
+            if t == tool_name and dd == decision:
                 count += 1
         return count
 
@@ -232,8 +256,14 @@ class TrustIntentMonitor:
         base: MonitorDecision,
         session_state: Dict[str, Any],
     ) -> MonitorDecision:
+        # IMPORTANT: do NOT deduct budget for actions that are already BLOCKed
+        # (budget should reflect executed/approved actions, not blocked attempts).
         budget = float(session_state.get("risk_budget", self.default_risk_budget))
-        budget -= float(base.risk_score)
+
+        # ASK is not executed yet (needs human approval)
+        if base.decision == "ALLOW":
+            budget -= float(base.risk_score)
+
         session_state["risk_budget"] = budget
         base.metadata["risk_budget"] = round(budget, 3)
 
@@ -303,7 +333,8 @@ class TrustIntentMonitor:
                 metadata={"provenance": {"source": "unknown", "tainted": True}},
             )
             d = self._attach_audit_defaults(d, goal, tool_name, tool_args)
-            return self._apply_risk_budget(d, session_state)
+            d = self._apply_risk_budget(d, session_state)
+            return self._enforce_high_risk_hard_block(d)
 
         if tool_name == "read_file":
             d = self._handle_read_file(tool_args)
@@ -338,9 +369,20 @@ class TrustIntentMonitor:
                     metadata={"provenance": {"source": "internal", "tainted": False}},
                 )
 
+        # Order matters:
+        # 1) repetition escalation can raise risk/decision
         d = self._escalate_if_repeated(d, tool_name, history)
+
+        # 2) audit defaults
         d = self._attach_audit_defaults(d, goal, tool_name, tool_args)
-        return self._apply_risk_budget(d, session_state)
+
+        # 3) apply budget rules (may escalate ALLOW->ASK, etc.)
+        d = self._apply_risk_budget(d, session_state)
+
+        # 4) Step 3 hard-block at high risk (final override)
+        d = self._enforce_high_risk_hard_block(d)
+
+        return d
 
     # --------------------------
     # Handlers
@@ -441,9 +483,7 @@ class TrustIntentMonitor:
             "provenance": {"source": "db", "tainted": False},
         }
 
-        # --------------------------
         # (1) STRICT MODE: any classified SQL is BLOCK
-        # --------------------------
         if policy_mode == "strict" and classified_hit:
             return MonitorDecision(
                 "BLOCK",
@@ -453,9 +493,7 @@ class TrustIntentMonitor:
                 meta,
             )
 
-        # --------------------------
         # (2) CRITICAL classified access (both modes)
-        # --------------------------
         if sig.base_score >= 0.9:
             return MonitorDecision(
                 "BLOCK",
@@ -465,9 +503,7 @@ class TrustIntentMonitor:
                 meta,
             )
 
-        # --------------------------
         # (3) ASK for classified OR missing LIMIT (balanced)
-        # --------------------------
         if sig.base_score >= 0.6 or sig.missing_limit:
             reason_bits = []
             if classified_hit:
@@ -491,9 +527,7 @@ class TrustIntentMonitor:
                 meta,
             )
 
-        # --------------------------
         # (4) LOW risk SQL
-        # --------------------------
         return MonitorDecision(
             "ALLOW",
             "SQL approved (no classified data detected).",
@@ -516,7 +550,6 @@ class TrustIntentMonitor:
         to_l = to_raw.lower()
         subject_l = subject_raw.lower()
         body_l = body_raw.lower()
-
         combined = f"{subject_l}\n{body_l}"
 
         # 0) Basic validation (ASK)
@@ -528,6 +561,9 @@ class TrustIntentMonitor:
                 ["EMAIL_INVALID_RECIPIENT"],
                 {"provenance": {"source": "egress", "tainted": True}},
             )
+
+        # Parse domain once
+        domain = to_l.split("@", 1)[-1].strip() if "@" in to_l else ""
 
         # 1) HARD BLOCKS first (regardless of goal)
         contains_keyword_secret = any(k in combined for k in self.sensitive_keywords)
@@ -556,7 +592,6 @@ class TrustIntentMonitor:
             )
 
         # 2) MULTI-STEP RULE (STRICT/BALANCED)
-        # If classified DB access happened earlier in this session, egress must be controlled.
         if session_state.get("classified_accessed") is True:
             if getattr(self, "policy_mode", "balanced") == "strict":
                 return MonitorDecision(
@@ -569,17 +604,16 @@ class TrustIntentMonitor:
                         "provenance": {"source": "egress", "tainted": True},
                     },
                 )
-            else:
-                return MonitorDecision(
-                    "ASK",
-                    "Egress requires confirmation because classified data was accessed earlier in this session.",
-                    0.85,
-                    ["EGRESS_AFTER_CLASSIFIED_ASK"],
-                    {
-                        "classified_sources": session_state.get("classified_sources", []),
-                        "provenance": {"source": "egress", "tainted": True},
-                    },
-                )
+            return MonitorDecision(
+                "ASK",
+                "Egress requires confirmation because classified data was accessed earlier in this session.",
+                0.85,
+                ["EGRESS_AFTER_CLASSIFIED_ASK"],
+                {
+                    "classified_sources": session_state.get("classified_sources", []),
+                    "provenance": {"source": "egress", "tainted": True},
+                },
+            )
 
         # 3) Goal alignment (ASK)
         email_intent_terms = ("email", "send", "mail", "message", "share", "forward", "notify", "report")
@@ -592,19 +626,7 @@ class TrustIntentMonitor:
                 {"provenance": {"source": "egress", "tainted": True}},
             )
 
-        # 4) Domain allowlist gating (ASK) — if allowlist is set
-        if self.email_domain_allowlist:
-            domain = to_l.split("@", 1)[-1].strip() if "@" in to_l else ""
-            if not domain or domain not in self.email_domain_allowlist:
-                return MonitorDecision(
-                    "ASK",
-                    "Recipient domain not allowlisted. Confirm before sending.",
-                    0.8,
-                    ["EMAIL_DOMAIN_NOT_ALLOWED"],
-                    {"domain": domain, "provenance": {"source": "egress", "tainted": True}},
-                )
-
-        # 5) Taint (ASK)
+        # 4) Taint (ASK)
         tainted_flag = bool(tool_args.get("tainted"))
         tainted_inferred = self._infer_taint_from_history(history)
         if tainted_flag or tainted_inferred:
@@ -620,6 +642,26 @@ class TrustIntentMonitor:
                 },
             )
 
+        # 5) Allowlist mode (enterprise)
+        if self.email_domain_allowlist:
+            if not domain or domain not in self.email_domain_allowlist:
+                return MonitorDecision(
+                    "ASK",
+                    "Recipient domain not allowlisted. Confirm before sending.",
+                    0.8,
+                    ["EMAIL_DOMAIN_NOT_ALLOWED"],
+                    {"domain": domain, "provenance": {"source": "egress", "tainted": True}},
+                )
+
+            return MonitorDecision(
+                "ALLOW",
+                "Email allowed: recipient domain allowlisted and content appears safe.",
+                0.3,
+                ["EMAIL_ALLOWED_ALLOWLIST"],
+                {"domain": domain, "provenance": {"source": "egress", "tainted": False}},
+            )
+
+        # 6) Default mode: always require confirmation for egress
         return MonitorDecision(
             "ASK",
             "Email sending requires confirmation (egress control).",

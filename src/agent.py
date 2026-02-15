@@ -70,6 +70,7 @@ class SimpleRuntimeAgent:
         self.policy = get_policy(policy_mode)
         self.history: List[StepRecord] = []
         self.session_state: Dict[str, Any] = {}
+        self.session_state["terminated"] = False
 
     @staticmethod
     def _sanitize_tool_args(tool_args: Dict[str, Any]) -> Dict[str, Any]:
@@ -96,18 +97,10 @@ class SimpleRuntimeAgent:
     def _effective_redaction_policy(self, tool_name: str, reason_codes: List[str]) -> Any:
         """
         Decide how aggressively to redact tool outputs before storing in history.
-        This is defense-in-depth: even after a human approves, we avoid leaking.
-
-        Expected policy structure (flexible):
-          - policy["redaction"][tool_name]            -> normal redaction config
-          - policy["redaction_strict"][tool_name]     -> strict redaction config
-          - policy["redaction_default"]               -> default config
-
-        If your src.policy uses a different shape, this function still degrades safely.
+        Defense-in-depth: even after a human approves, avoid leaking sensitive data.
         """
         pol = self.policy if isinstance(self.policy, dict) else {}
 
-        # Base policy
         base = (
             pol.get("redaction", {}).get(tool_name)
             if isinstance(pol.get("redaction"), dict)
@@ -116,7 +109,6 @@ class SimpleRuntimeAgent:
         if base is None:
             base = pol.get("redaction_default", None)
 
-        # Escalate to strict when classified-related codes are present
         classified_related = any(
             (c or "").startswith("SQL_CLASSIFIED")
             or (c or "").startswith("SQL_CRITICAL_CLASSIFIED")
@@ -133,6 +125,32 @@ class SimpleRuntimeAgent:
             return strict if strict is not None else base
 
         return base
+
+    def _mark_classified_access_if_needed(self, step: int, record: StepRecord) -> None:
+        """
+        Multi-step state: mark classified access only AFTER successful SQL execution,
+        based on monitor metadata (classified_hit).
+        """
+        if record.tool != "run_sql":
+            return
+        if record.tool_ok is not True:
+            return
+
+        classified_hit = bool((record.monitor_meta or {}).get("classified_hit"))
+        if not classified_hit:
+            return
+
+        self.session_state["classified_accessed"] = True
+        self.session_state.setdefault("classified_sources", [])
+        self.session_state["classified_sources"].append(
+            {
+                "step": step,
+                "tool": record.tool,
+                "tables": ((record.monitor_meta or {}).get("signals") or {}).get("tables", []),
+                "classified_keys": (record.monitor_meta or {}).get("classified_keys", []),
+                "args_hash": (record.monitor_meta or {}).get("args_hash"),
+            }
+        )
 
     def run(
         self,
@@ -151,14 +169,12 @@ class SimpleRuntimeAgent:
           - If the session is terminated (BLOCK or denial), run() will not execute further actions.
         """
         try:
-            # If a previous run was terminated, don't continue.
             if self.session_state.get("terminated") is True:
                 return self.history
 
             start_step = len(self.history) + 1
 
             for i, action in enumerate(proposed_actions, start=start_step):
-                # If termination happened mid-loop, stop immediately.
                 if self.session_state.get("terminated") is True:
                     break
 
@@ -208,7 +224,6 @@ class SimpleRuntimeAgent:
                     if isinstance(getattr(r, "monitor_meta", None), dict):
                         merged_meta.update(r.monitor_meta)
 
-                    # Ensure provenance is a dict; if missing/bad, fall back to tool_meta provenance
                     prov = merged_meta.get("provenance")
                     if not isinstance(prov, dict):
                         tool_meta = getattr(r, "tool_meta", None)
@@ -257,11 +272,13 @@ class SimpleRuntimeAgent:
                 # -------------------------
                 # Enforce decision: ASK (manual approval)
                 # -------------------------
+                # -------------------------
+                # Enforce decision: ASK (manual approval)
+                # -------------------------
                 if md.decision == "ASK" and not auto_confirm:
                     self.history.append(record)
 
                     if not interactive:
-                        # Non-interactive => terminate safely
                         record.approved = False
                         record.approved_by = "non_interactive"
                         self.session_state["terminated"] = True
@@ -274,15 +291,25 @@ class SimpleRuntimeAgent:
                     print(f"Risk score: {md.risk_score}")
                     print(f"Reason: {md.reason}")
 
-                    user_choice = input("Approve this action? (y/n): ").strip().lower()
+                    # ✅ must actually enforce the approval decision
+                    ans = input("Approve this action? (y/n): ").strip().lower()
+                    if ans != "y":
+                        last = self.history[-1]
+                        last.approved = False
+                        last.approved_by = "human"
 
-                    if user_choice not in ("y", "yes"):
-                        record.approved = False
-                        record.approved_by = "human"
+                        # ✅ mark terminal outcome in history
+                        last.decision = "BLOCK"   # or "DENY" if you want a new label
+                        last.reason = f"{last.reason} (Denied by human)"
+                        last.reason_codes = (last.reason_codes or []) + ["HUMAN_DENIED"]
+
                         self.session_state["terminated"] = True
-                        raise HumanDenied(f"Human denied approval at step {i}.")
+                        self.session_state["termination_reason"] = "Human denied approval"
 
-                    # Approved: execute tool ONCE and update the last record
+                        raise HumanDenied(f"Run stopped: human denied approval at step {i}.")
+
+
+                    # Approved -> execute tool
                     exec_args = self._sanitize_tool_args(tool_args)
                     tool_result = self._execute_tool(tool_name, exec_args)
 
@@ -290,31 +317,21 @@ class SimpleRuntimeAgent:
                     last.approved = True
                     last.approved_by = "human"
                     last.tool_ok = tool_result.ok
+
                     eff = self._effective_redaction_policy(tool_name, last.reason_codes)
+                    if eff is None:
+                        eff = self.policy
                     last.tool_result = redact(tool_result.result, eff)
+
                     last.tool_error = tool_result.error
                     last.tool_meta = tool_result.meta or {}
 
-                    # --- Multi-step state (correct): mark classified access only AFTER successful SQL execution ---
-                    if tool_name == "run_sql" and tool_result.ok:
-                        classified_hit = bool((last.monitor_meta or {}).get("classified_hit"))
-                        if classified_hit:
-                            self.session_state["classified_accessed"] = True
-                            self.session_state.setdefault("classified_sources", [])
-                            self.session_state["classified_sources"].append(
-                                {
-                                    "step": i,
-                                    "tool": tool_name,
-                                    "tables": ((last.monitor_meta or {}).get("signals") or {}).get("tables", []),
-                                    "classified_keys": (last.monitor_meta or {}).get("classified_keys", []),
-                                    "args_hash": (last.monitor_meta or {}).get("args_hash"),
-                                }
-                            )
+                    # ✅ multi-step state: only after actual execution
+                    self._mark_classified_access_if_needed(i, last)
 
-                    # For audit readability, mark as ALLOW after approval
+                    # For audit readability: reflect approval
                     last.decision = "ALLOW"
                     last.reason = f"{last.reason} (Approved by human)"
-
                     continue
 
                 # -------------------------
@@ -326,36 +343,24 @@ class SimpleRuntimeAgent:
                     record.decision = "ALLOW"
                     record.reason = f"{record.reason} (Auto-confirmed)"
 
-                # Execute tool
                 exec_args = self._sanitize_tool_args(tool_args)
                 tool_result = self._execute_tool(tool_name, exec_args)
 
                 record.tool_ok = tool_result.ok
                 eff = self._effective_redaction_policy(tool_name, record.reason_codes)
+                if eff is None:
+                    eff = self.policy
                 record.tool_result = redact(tool_result.result, eff)
+
                 record.tool_error = tool_result.error
                 record.tool_meta = tool_result.meta or {}
 
-                # --- Multi-step state (correct): mark classified access only AFTER successful SQL execution ---
-                if tool_name == "run_sql" and tool_result.ok:
-                    classified_hit = bool((record.monitor_meta or {}).get("classified_hit"))
-                    if classified_hit:
-                        self.session_state["classified_accessed"] = True
-                        self.session_state.setdefault("classified_sources", [])
-                        self.session_state["classified_sources"].append(
-                            {
-                                "step": i,
-                                "tool": tool_name,
-                                "tables": ((record.monitor_meta or {}).get("signals") or {}).get("tables", []),
-                                "classified_keys": (record.monitor_meta or {}).get("classified_keys", []),
-                                "args_hash": (record.monitor_meta or {}).get("args_hash"),
-                            }
-                        )
+                # ✅ multi-step state: only after actual execution
+                self._mark_classified_access_if_needed(i, record)
 
                 self.history.append(record)
 
             return self.history
 
         finally:
-            # Always save full runtime trace (even on crashes or early termination)
             save_run(self.history, self.goal)
