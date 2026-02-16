@@ -1,35 +1,63 @@
 # runtime-agent-guard
-
+## Deterministic Runtime Policy Enforcement for Tool-Using LLM Agents
 ## Overview
 
-**runtime-agent-guard** is a runtime security enforcement system for **tool-using AI agents**.
-It intercepts proposed tool actions and enforces explicit policy decisions **before any tool execution occurs**.
+**Runtime Agent Guard** is a policy-driven security layer for tool-using LLM agents.
+It intercepts every tool invocation at execution time and enforces explicit security invariants before the action is executed.
 
-The system produces one of three decisions for every agent action:
+Unlike prompt-level filtering or static moderation, this system operates at runtime with:
 
-- **ALLOW** — action is safe and executed immediately
-- **ASK** — action requires explicit human approval
-- **BLOCK** — action is unsafe and execution is prevented
+- Tool-aware inspection (SQL, email, file, web)
 
-The project focuses on:
-- Runtime control of agent behavior
-- Auditable and inspectable decisions
-- Least-privilege access to external systems
-- Human-in-the-loop safety for high-risk actions
+- Multi-step session state reasoning
 
-Designed for **research, experimentation, and demonstration** of trust-aware agent execution.
+- Classified data flow tracking
+
+- Deterministic ALLOW / ASK / BLOCK decisions
+
+- Configurable policy modes (Balanced / Strict)
+
+- Quantified friction vs. security trade-offs
+
+The system is designed for enterprise-grade agent deployments where LLMs interact with databases, filesystems, APIs, and communication channels.
 
 ---
 
-## Key Features
+## Problem Statement
 
-- Runtime interception of all agent tool calls
-- Explicit policy decisions (**ALLOW / ASK / BLOCK**)
-- Schema-aware SQL risk analysis
-- Sensitive content detection for email actions
-- Restricted filesystem access
-- Centralized audit logging
-- Modular and extensible architecture
+- new attack surfaces:
+
+- SQL bulk extraction
+
+- Sensitive table access
+
+- Credential leakage
+
+- Cross-step data exfiltration
+
+- Prompt-injection-induced tool misuse
+
+- Web → database → email multi-step chains
+
+Existing defenses focus on:
+
+- Input moderation
+
+- Static prompt filtering
+
+- Model-based classification
+
+- These approaches lack:
+
+- Deterministic runtime enforcement
+
+- Tool-specific reasoning
+
+- Session-level invariants
+
+- Formal friction measurement
+
+Runtime Agent Guard addresses these gaps.
 
 ---
 
@@ -68,27 +96,41 @@ This design ensures unsafe or ambiguous actions are stopped **before real-world 
 
 ## Core Components
 
-- `src/agent.py`  
-  Minimal agent loop that enforces runtime guard decisions
+## Core Design Principles
 
-- `src/monitor.py`  
-  Runtime trust, intent, and risk monitoring
+**1. Runtime Interception**
 
-- `src/sql_policy.py`  
-  Schema-aware SQL risk analysis using `sqlglot`
+All tool calls pass through a monitor before execution:
+- **Agent → Monitor → Decision → Tool (if allowed)**
+No tool executes without a policy verdict.
 
-- `src/policy.py`  
-  Central policy definitions and decision thresholds
 
-- `src/tools.py`  
-  Tool implementations and registry
+**2. Deterministic Policy Engine**
 
-- `src/logger.py`  
-  Runtime audit logging for decisions and metadata
+- Each tool call produces a structured RiskSignals object:
 
-The codebase is intentionally modular to support experimentation and extension.
+- Referenced tables
 
----
+- Referenced columns
+
+- Missing LIMIT indicators
+
+- Bulk extraction signals
+
+- Taint flags
+
+- Tool and operation priors
+
+- Signals are aggregated into a bounded risk score ∈ [0,1].
+
+Decision semantics:
+
+**| Decision | Meaning                     |**
+| -------- | --------------------------- |
+| ALLOW    | Safe to execute             |
+| ASK      | Requires human confirmation |
+| BLOCK    | High-risk action rejected   |
+
 
 ## Security Design Principles
 
