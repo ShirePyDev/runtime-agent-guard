@@ -126,10 +126,10 @@ No tool executes without a policy verdict.
 Decision semantics:
 
 **| Decision | Meaning                     |**
-| -------- | --------------------------- |
-| ALLOW    | Safe to execute             |
-| ASK      | Requires human confirmation |
-| BLOCK    | High-risk action rejected   |
+- | -------- | --------------------------- |
+- | ALLOW    | Safe to execute             |
+- | ASK      | Requires human confirmation |
+- | BLOCK    | High-risk action rejected   |
 
 
 ## Security Design Principles
