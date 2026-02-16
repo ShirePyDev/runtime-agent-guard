@@ -1,5 +1,33 @@
-.DS_Store
-**/.DS_Store
-logs/*
-logs/*
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# Coverage
+.coverage
+htmlcov/
+
+# Logs
+logs/
 !logs/.gitkeep
+
+# Database / local data
+*.db
+data/*.db
+
+# Eval cache
+eval/cache/
+
+# OS files
+.DS_Store
+
+# VSCode
+.vscode/
