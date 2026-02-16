@@ -102,6 +102,7 @@ This design ensures unsafe or ambiguous actions are stopped **before real-world 
 
 All tool calls pass through a monitor before execution:
 - **Agent → Monitor → Decision → Tool (if allowed)**
+
 No tool executes without a policy verdict.
 
 
