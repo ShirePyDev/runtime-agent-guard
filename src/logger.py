@@ -10,6 +10,19 @@ LOGS_DIR = Path(__file__).resolve().parents[1] / "logs"
 SCHEMA_VERSION = "runtime_agent_guard.v1"
 
 
+def _json_safe(obj):
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, set):
+        return sorted([_json_safe(v) for v in obj])
+    return obj
+
+
+
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -104,6 +117,6 @@ def save_run(
     }
 
     with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        json.dump(_json_safe(data), f, indent=2, ensure_ascii=False)
 
     return path

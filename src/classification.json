@@ -1,0 +1,52 @@
+{
+  "version": "1.0",
+
+  "tables": {
+    "users": {
+      "sensitivity": "high",
+      "score": 0.8,
+      "tags": ["pii"]
+    },
+    "api_keys": {
+      "sensitivity": "critical",
+      "score": 1.0,
+      "tags": ["secrets"]
+    }
+  },
+
+  "columns": {
+    "users.email": {
+      "sensitivity": "critical",
+      "score": 1.0,
+      "tags": ["pii"]
+    },
+    "users.phone": {
+      "sensitivity": "high",
+      "score": 0.8,
+      "tags": ["pii"]
+    }
+  },
+
+  "column_name_heuristics": {
+    "email": {
+      "sensitivity": "medium",
+      "score": 0.6,
+      "tags": ["pii_heuristic"]
+    },
+    "password": {
+      "sensitivity": "high",
+      "score": 0.8,
+      "tags": ["secret_heuristic"]
+    },
+    "token": {
+      "sensitivity": "high",
+      "score": 0.8,
+      "tags": ["secret_heuristic"]
+    },
+    "api_key": {
+      "sensitivity": "critical",
+      "score": 1.0,
+      "tags": ["secret_heuristic"]
+    }
+  }
+}
