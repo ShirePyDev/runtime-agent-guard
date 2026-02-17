@@ -132,61 +132,215 @@ Decision semantics:
 - | ASK      | Requires human confirmation |
 - | BLOCK    | High-risk action rejected   |
 
+**3. Multi-Step Security Invariants**
 
-## Security Design Principles
+The system maintains session state:
 
-- **Runtime enforcement**  
-  All tool calls are intercepted before execution
+- classified_accessed
 
-- **Least privilege**  
-  External systems are accessed using restricted, read-only roles
+- classified_sources
 
-- **Defense in depth**  
-  Independent protections across monitoring, policy, and tool layers
+- risk_budget
 
-- **Human-in-the-loop**  
-  High-impact or ambiguous actions require explicit approval
+- Taint history window
+
+Example invariant:
+
+If classified data is accessed during the session, any subsequent egress (email) must be ASK (Balanced) or BLOCK (Strict).
+
+This prevents multi-step data exfiltration chains.
+
+**4. SQL Sensitivity Classification**
+
+SQL statements are parsed using structured AST analysis (via sqlglot).
+
+Detection includes:
+
+- Sensitive table access
+
+- Sensitive column access
+
+- Column-name heuristics (email, password, token, api_key)
+
+- Bulk access (SELECT * without LIMIT)
+
+- Explicit LIMIT absence
+
+Classification rules are configurable via classification.json.
+
+**5. Taint Propagation**
+
+Web search results and external inputs are marked as tainted.
+
+The monitor:
+
+- Tracks taint across steps
+
+- Infers taint from history
+
+- Detects tainted content usage in outgoing email
+
+- Escalates intervention accordingly
+
+**6. Risk Budget Enforcement**
+
+Each session maintains a configurable risk budget.
+
+- High-risk actions deplete the budget.
+
+- Low remaining budget escalates ALLOW → ASK.
+
+- Budget exhaustion forces BLOCK.
+
+This mitigates persistent probing and incremental attack strategies.
+
+**7. Repetition Escalation**
+
+Repeated ASK or BLOCK attempts escalate:
+
+- Repeated ASK → higher risk
+
+- Repeated BLOCK → forced BLOCK
+
+Prevents brute-force or persistence attacks.
+
+## Policy Modes
+
+## Balanced Mode
+
+**Sensitive SQL → ASK**
+
+**Classified → egress → ASK**
+
+- Internal safe email allowed
+
+- Designed for enterprise productivity with human oversight
+
+## Strict Mode
+
+- **Any classified SQL → BLOCK**
+
+- **Classified → egress → BLOCK**
+
+- More conservative posture
+
+- Suitable for regulated environments
+
+### Evaluation Framework
+
+**The system includes a benchmark suite:**
+
+- Multi-step attack episodes
+
+- SQL exfiltration scenarios
+
+- File boundary violations
+
+- Web → email taint chains
+
+- Credential leakage patterns
+
+**Evaluation protocols:**
+
+- **STOP_ON_ASK (measures friction)**
+- **AUTO_APPROVE_ASK (measures downstream containment)**
+
+**Metrics:**
+
+- TPR / FPR (BLOCK-only)
+
+- TPR / FPR (intervention: ASK or BLOCK)
+
+- ASK per episode (friction)
+
+- Latency (ms per decision)
+
+- Policy match consistency
+
+## **Repository Structure**
+
+src/
+  monitor.py        # Runtime guard + policy engine
+  signals.py        # Risk signal aggregation
+  classification.py # Sensitivity classifier
+  agent.py          # Tool-using agent loop
+  tools.py          # Tool implementations
+  logger.py         # Structured audit logs
+  sql_policy.py     # SQL parsing and risk logic
+
+eval/
+  run_eval.py
+  ragsecbench_v1.jsonl
+  labeling_rules.md
+  schema.md
+  baselines/
+
+demo/
+  demo_stepwise.py
+  demo_taint_history.py
 
 ---
 
-## Tooling Overview
+## Threat Model
 
-- **PostgreSQL**
-  - Accessed via a read-only role (`agent_ro`)
-  - Role provisioned by `data/db/init_sqlite.sql`
+**The system assumes:**
 
-- **Schema-aware SQL security**
-  - Sensitive table and column detection
-  - Bulk or unbounded query detection
+- The LLM may be manipulated by prompt injection.
 
-- **Mocked email sender**
-  - Emails are logged locally
-  - No external delivery occurs
+- External data sources may be adversarial.
 
-- **Restricted file access**
-  - File reads limited to `data/docs`
+- Tool invocations may expose sensitive resources.
 
----
+- Multi-step chains may occur across session boundaries.
 
-## Audit Logging
+The system does not attempt to:
 
-All runtime decisions are logged, including:
-- Proposed action and arguments
-- Policy decision (**ALLOW / ASK / BLOCK**)
-- Triggered rule and risk reason
-- Timestamp and execution metadata
+- Prove formal non-interference.
 
-Logs support debugging, inspection, and accountability.
+- Replace full DLP solutions.
 
----
+- Detect semantic covert channels.
 
-### Limitations
+It enforces runtime policy invariants at the tool boundary.
 
-- Does not aim to block all prompt-level attacks
+## Performance Characteristics
 
-- Policies are rule-based rather than learned
+- Deterministic enforcement
 
-- Human approval is simulated rather than fully interactive
+- No secondary LLM in decision loop
+
+- Sub-millisecond average evaluation latency
+
+- Suitable for inline production gating
+
+
+## Limitations
+
+- Rule-based sensitivity classification
+
+- No semantic query understanding beyond heuristics
+
+- Risk scoring weights are manually tuned
+
+- Limited formal guarantees
+
+
+## Intended Use
+
+**This project is intended for:**
+
+- Research on LLM agent security
+
+- Enterprise runtime guardrail prototypes
+
+- Tool-aware policy enforcement experiments
+
+- Multi-step exfiltration detection studies
+
+
+## License
+
+**MIT License**
 
 ---
 
