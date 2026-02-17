@@ -268,16 +268,16 @@ Prevents brute-force or persistence attacks.
   - logger.py         # Structured audit logs
   - sql_policy.py     # SQL parsing and risk logic
 
-eval/
-  run_eval.py
-  ragsecbench_v1.jsonl
-  labeling_rules.md
-  schema.md
-  baselines/
+**eval/**
+  - run_eval.py
+  - ragsecbench_v1.jsonl
+  - labeling_rules.md
+  - schema.md
+  - baselines/
 
-demo/
-  demo_stepwise.py
-  demo_taint_history.py
+**demo/**
+  - demo_stepwise.py
+  - demo_taint_history.py
 
 ---
 
