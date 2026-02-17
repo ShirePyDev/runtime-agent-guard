@@ -206,7 +206,7 @@ Prevents brute-force or persistence attacks.
 
 ## Policy Modes
 
-## Balanced Mode
+**Balanced Mode**
 
 **Sensitive SQL → ASK**
 
@@ -257,16 +257,16 @@ Prevents brute-force or persistence attacks.
 
 - Policy match consistency
 
-## **Repository Structure**
+## Repository Structure
 
-src/
-  monitor.py        # Runtime guard + policy engine
-  signals.py        # Risk signal aggregation
-  classification.py # Sensitivity classifier
-  agent.py          # Tool-using agent loop
-  tools.py          # Tool implementations
-  logger.py         # Structured audit logs
-  sql_policy.py     # SQL parsing and risk logic
+**src/**
+  - monitor.py        # Runtime guard + policy engine
+  - signals.py        # Risk signal aggregation
+  - classification.py # Sensitivity classifier
+  - agent.py          # Tool-using agent loop
+  - tools.py          # Tool implementations
+  - logger.py         # Structured audit logs
+  - sql_policy.py     # SQL parsing and risk logic
 
 eval/
   run_eval.py
